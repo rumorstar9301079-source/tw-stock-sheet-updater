@@ -32,19 +32,30 @@ def fetch_latest_yf(symbol: str, market: str):
         interval="1d",
         progress=False,
         auto_adjust=False,
-        threads=False
+        threads=False,
+        group_by="column",   # ✅ 避免回傳奇怪的分組格式
     )
     if df is None or df.empty:
         return None
 
-    last = df.tail(1)
-    d = last.index[0].strftime("%Y-%m-%d")
-    close = float(last["Close"].iloc[0])
-    vol_shares = float(last["Volume"].iloc[0])
+    # ✅ 如果是 MultiIndex 欄位（有兩層），把它壓扁成單層
+    if isinstance(df.columns, pd.MultiIndex):
+        # 常見格式：('Close','2330.TW') -> 'Close'
+        df.columns = [c[0] for c in df.columns]
 
-    # ✅ 規則：上櫃(otc)寫回「張」，上市(tse)維持「股」
+    last_row = df.tail(1)
+
+    # 取日期
+    d = last_row.index[0].strftime("%Y-%m-%d")
+
+    # ✅ 保證取到單一值
+    close = float(last_row["Close"].values[0])
+    vol_shares = float(last_row["Volume"].values[0])
+
+    # 上櫃(otc)寫回「張」；上市(tse)維持「股」
     vol_out = int(round(vol_shares / 1000.0)) if market == "otc" else vol_shares
     return d, close, vol_out
+
 
 def main():
     sheet_url = os.environ["SHEET_URL"]
