@@ -5,9 +5,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 WS_SYMBOLS = "SYMBOLS"
-WS_PRICES = "PRICES"
+WS_PRICES  = "PRICES"
+
 LOOKBACK_CAL_DAYS = 30
 SLEEP_SEC = 0.2
+
 
 def get_client():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
@@ -18,14 +20,42 @@ def get_client():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
+
 def fetch_latest_yf(symbol: str, market: str):
+    """
+    回傳 (date_str, close, volume_out)
+    - market=tse: volume_out = 股
+    - market=otc: volume_out = 張 (股/1000)
+    """
     suffix = ".TW" if market == "tse" else ".TWO"
     ticker = f"{symbol}{suffix}"
 
+    def _normalize(df):
+        if df is None or df.empty:
+            return None
+
+        # 可能出現 MultiIndex 欄位，把它壓扁
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        need = {"Close", "Volume"}
+        if not need.issubset(set(df.columns)):
+            return None
+
+        last = df.tail(1)
+        d = last.index[0].strftime("%Y-%m-%d")
+
+        close = float(last["Close"].values[0])
+        vol_shares = float(last["Volume"].values[0])
+
+        vol_out = int(round(vol_shares / 1000.0)) if market == "otc" else vol_shares
+        return d, close, vol_out
+
+    # 1) 先用 download（快）
     end = dt.datetime.utcnow()
     start = end - dt.timedelta(days=LOOKBACK_CAL_DAYS)
 
-    df = yf.download(
+    df1 = yf.download(
         ticker,
         start=start.strftime("%Y-%m-%d"),
         end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
@@ -33,28 +63,19 @@ def fetch_latest_yf(symbol: str, market: str):
         progress=False,
         auto_adjust=False,
         threads=False,
-        group_by="column",   # ✅ 避免回傳奇怪的分組格式
+        group_by="column",
     )
-    if df is None or df.empty:
-        return None
+    res = _normalize(df1)
+    if res:
+        return res
 
-    # ✅ 如果是 MultiIndex 欄位（有兩層），把它壓扁成單層
-    if isinstance(df.columns, pd.MultiIndex):
-        # 常見格式：('Close','2330.TW') -> 'Close'
-        df.columns = [c[0] for c in df.columns]
+    # 2) 備援：Ticker().history（對部分 OTC 更穩）
+    df2 = yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
+    res = _normalize(df2)
+    if res:
+        return res
 
-    last_row = df.tail(1)
-
-    # 取日期
-    d = last_row.index[0].strftime("%Y-%m-%d")
-
-    # ✅ 保證取到單一值
-    close = float(last_row["Close"].values[0])
-    vol_shares = float(last_row["Volume"].values[0])
-
-    # 上櫃(otc)寫回「張」；上市(tse)維持「股」
-    vol_out = int(round(vol_shares / 1000.0)) if market == "otc" else vol_shares
-    return d, close, vol_out
+    return None
 
 
 def main():
@@ -62,23 +83,38 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
+    # 讀 SYMBOLS
     ws_sym = sh.worksheet(WS_SYMBOLS)
     vals = ws_sym.get_all_values()
-    df = pd.DataFrame(vals[1:], columns=[c.strip().lower() for c in vals[0]])
+    if not vals or len(vals) < 2:
+        raise RuntimeError("SYMBOLS 工作表沒有資料")
 
-    df = df[df["active"] != "0"].copy()
+    header = [c.strip().lower() for c in vals[0]]
+    df = pd.DataFrame(vals[1:], columns=header)
+
+    # 必要欄位檢查
+    if "symbol" not in df.columns or "market" not in df.columns:
+        raise RuntimeError("SYMBOLS 需要欄位：symbol, market（market=tse/otc）")
+
+    # active 欄位可有可無：有就用，沒有就全算 active
+    if "active" in df.columns:
+        df = df[df["active"].astype(str).str.strip() != "0"].copy()
+
     df["symbol"] = df["symbol"].astype(str).str.strip()
     df["market"] = df["market"].astype(str).str.lower().str.strip()
+
     df = df[df["market"].isin(["tse", "otc"])].copy()
     if df.empty:
-        raise RuntimeError("SYMBOLS 沒有可用股票（tse/otc & Active!=0）")
+        raise RuntimeError("SYMBOLS 沒有可用股票（market 必須是 tse 或 otc）")
 
+    # 讀 PRICES（避免重複寫入）
     ws_p = sh.worksheet(WS_PRICES)
     pvals = ws_p.get_all_values()
+
     exist = set()
     if pvals and len(pvals) > 1:
-        header = [h.strip().lower() for h in pvals[0]]
-        dfp = pd.DataFrame(pvals[1:], columns=header)
+        pheader = [h.strip().lower() for h in pvals[0]]
+        dfp = pd.DataFrame(pvals[1:], columns=pheader)
         if "date" in dfp.columns and "symbol" in dfp.columns:
             exist = set(zip(dfp["date"].astype(str), dfp["symbol"].astype(str)))
 
@@ -89,7 +125,7 @@ def main():
 
         res = fetch_latest_yf(sym, market)
         if not res:
-            print(f"[WARN] {sym}({market}) no data")
+            print(f"[WARN] {sym}({market}) no data from Yahoo ticker={sym}{'.TW' if market=='tse' else '.TWO'}")
             time.sleep(SLEEP_SEC)
             continue
 
@@ -109,6 +145,7 @@ def main():
         print(f"[DONE] appended {len(rows)} rows")
     else:
         print("[DONE] nothing to append")
+
 
 if __name__ == "__main__":
     main()
