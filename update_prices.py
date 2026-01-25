@@ -1,16 +1,22 @@
-import os, json, time, datetime as dt
+import os
+import json
+import time
+import datetime as dt
+
 import pandas as pd
 import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
+
 WS_SYMBOLS = "SYMBOLS"
-WS_PRICES  = "PRICES"
+WS_PRICES = "PRICES"
 
 LOOKBACK_CAL_DAYS = 30
 SLEEP_SEC = 0.2
 
 
+# ---------- Google Sheets ----------
 def get_client():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     scopes = [
@@ -21,25 +27,24 @@ def get_client():
     return gspread.authorize(creds)
 
 
+# ---------- Yahoo Finance ----------
 def fetch_latest_yf(symbol: str, market: str):
     """
-    回傳 (date_str, close, volume_out)
-    - market=tse: volume_out = 股
-    - market=otc: volume_out = 張 (股/1000)
+    回傳 (date_str, close, volume_in_lots)
+    volume 一律回傳「張」
     """
     suffix = ".TW" if market == "tse" else ".TWO"
     ticker = f"{symbol}{suffix}"
 
-    def _normalize(df):
+    def normalize(df):
         if df is None or df.empty:
             return None
 
-        # 可能出現 MultiIndex 欄位，把它壓扁
+        # 壓扁 MultiIndex 欄位
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
 
-        need = {"Close", "Volume"}
-        if not need.issubset(set(df.columns)):
+        if "Close" not in df.columns or "Volume" not in df.columns:
             return None
 
         last = df.tail(1)
@@ -48,13 +53,15 @@ def fetch_latest_yf(symbol: str, market: str):
         close = float(last["Close"].values[0])
         vol_shares = float(last["Volume"].values[0])
 
-        vol_out = int(round(vol_shares / 1000.0)) if market == "otc" else vol_shares
-        return d, close, vol_out
+        # ✅ 一律轉成「張」
+        vol_lots = int(round(vol_shares / 1000.0))
 
-    # 1) 先用 download（快）
+        return d, close, vol_lots
+
     end = dt.datetime.utcnow()
     start = end - dt.timedelta(days=LOOKBACK_CAL_DAYS)
 
+    # 1️⃣ download（快）
     df1 = yf.download(
         ticker,
         start=start.strftime("%Y-%m-%d"),
@@ -65,19 +72,20 @@ def fetch_latest_yf(symbol: str, market: str):
         threads=False,
         group_by="column",
     )
-    res = _normalize(df1)
+    res = normalize(df1)
     if res:
         return res
 
-    # 2) 備援：Ticker().history（對部分 OTC 更穩）
+    # 2️⃣ 備援：Ticker().history（OTC 常比較穩）
     df2 = yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
-    res = _normalize(df2)
+    res = normalize(df2)
     if res:
         return res
 
     return None
 
 
+# ---------- Main ----------
 def main():
     sheet_url = os.environ["SHEET_URL"]
     gc = get_client()
@@ -85,36 +93,34 @@ def main():
 
     # 讀 SYMBOLS
     ws_sym = sh.worksheet(WS_SYMBOLS)
-    vals = ws_sym.get_all_values()
-    if not vals or len(vals) < 2:
-        raise RuntimeError("SYMBOLS 工作表沒有資料")
+    values = ws_sym.get_all_values()
+    if len(values) < 2:
+        raise RuntimeError("SYMBOLS 沒有資料")
 
-    header = [c.strip().lower() for c in vals[0]]
-    df = pd.DataFrame(vals[1:], columns=header)
+    header = [h.strip().lower() for h in values[0]]
+    df = pd.DataFrame(values[1:], columns=header)
 
-    # 必要欄位檢查
     if "symbol" not in df.columns or "market" not in df.columns:
-        raise RuntimeError("SYMBOLS 需要欄位：symbol, market（market=tse/otc）")
+        raise RuntimeError("SYMBOLS 必須包含 symbol, market 欄位")
 
-    # active 欄位可有可無：有就用，沒有就全算 active
     if "active" in df.columns:
-        df = df[df["active"].astype(str).str.strip() != "0"].copy()
+        df = df[df["active"].astype(str).str.strip() != "0"]
 
     df["symbol"] = df["symbol"].astype(str).str.strip()
     df["market"] = df["market"].astype(str).str.lower().str.strip()
+    df = df[df["market"].isin(["tse", "otc"])]
 
-    df = df[df["market"].isin(["tse", "otc"])].copy()
     if df.empty:
-        raise RuntimeError("SYMBOLS 沒有可用股票（market 必須是 tse 或 otc）")
+        raise RuntimeError("SYMBOLS 沒有有效股票")
 
-    # 讀 PRICES（避免重複寫入）
+    # 讀 PRICES（避免重複）
     ws_p = sh.worksheet(WS_PRICES)
     pvals = ws_p.get_all_values()
 
     exist = set()
-    if pvals and len(pvals) > 1:
-        pheader = [h.strip().lower() for h in pvals[0]]
-        dfp = pd.DataFrame(pvals[1:], columns=pheader)
+    if len(pvals) > 1:
+        ph = [h.strip().lower() for h in pvals[0]]
+        dfp = pd.DataFrame(pvals[1:], columns=ph)
         if "date" in dfp.columns and "symbol" in dfp.columns:
             exist = set(zip(dfp["date"].astype(str), dfp["symbol"].astype(str)))
 
@@ -125,7 +131,7 @@ def main():
 
         res = fetch_latest_yf(sym, market)
         if not res:
-            print(f"[WARN] {sym}({market}) no data from Yahoo ticker={sym}{'.TW' if market=='tse' else '.TWO'}")
+            print(f"[WARN] {sym}({market}) no data from Yahoo ({sym}{'.TW' if market=='tse' else '.TWO'})")
             time.sleep(SLEEP_SEC)
             continue
 
@@ -136,8 +142,7 @@ def main():
             continue
 
         rows.append([d, sym, close, vol])
-        unit = "張" if market == "otc" else "股"
-        print(f"[OK] {sym}({market}) {d} close={close} vol({unit})={vol}")
+        print(f"[OK] {sym}({market}) {d} close={close} vol(張)={vol}")
         time.sleep(SLEEP_SEC)
 
     if rows:
