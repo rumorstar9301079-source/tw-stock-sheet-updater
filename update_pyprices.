@@ -30,7 +30,7 @@ def fetch_latest_yf(symbol: str, market: str):
     """
     return (date_str, close, vol_lots)
     vol_lots 一律「張」
-    date_str 用台灣時間 YYYY-MM-DD
+    date_str 用 YYYY-MM-DD（交易日）
     """
     suffix = ".TW" if market == "tse" else ".TWO"
     ticker = f"{symbol}{suffix}"
@@ -46,11 +46,9 @@ def fetch_latest_yf(symbol: str, market: str):
             return None
 
         last = df.tail(1)
-        # 取「交易日」日期（index 是交易日）
         d = last.index[0].strftime("%Y-%m-%d")
         close = float(last["Close"].values[0])
         vol_shares = float(last["Volume"].values[0])
-
         vol_lots = int(round(vol_shares / 1000.0))  # ✅ 一律張
         return d, close, vol_lots
 
@@ -79,9 +77,9 @@ def fetch_latest_yf(symbol: str, market: str):
     return None
 
 
-def build_symbol_index(ws):
+def build_symbol_date_index(ws):
     """
-    建立 symbol -> row_number 的索引
+    建立 (symbol, date) -> row_number 的索引
     row_number 是 Google Sheet 的實際列號（從 1 開始，含 header）
     """
     vals = ws.get_all_values()
@@ -91,20 +89,21 @@ def build_symbol_index(ws):
     header = [h.strip().lower() for h in vals[0]]
     rows = vals[1:]
 
-    if "symbol" not in header:
-        raise RuntimeError("PRICES 必須有 Symbol 欄位")
+    if "symbol" not in header or "date" not in header:
+        raise RuntimeError("PRICES 必須有 Date, Symbol 欄位")
 
     idx_symbol = header.index("symbol")
+    idx_date = header.index("date")
 
     index = {}
     # 第1列 header，所以 data 從第2列開始
     for row_no, r in enumerate(rows, start=2):
-        if len(r) <= idx_symbol:
+        if len(r) <= max(idx_symbol, idx_date):
             continue
         s = str(r[idx_symbol]).strip()
-        if s:
-            # 若有重複 symbol，以最後出現的那列為準（覆蓋那列）
-            index[s] = row_no
+        d = str(r[idx_date]).strip()
+        if s and d:
+            index[(s, d)] = row_no
 
     return index, header
 
@@ -136,9 +135,9 @@ def main():
     if df.empty:
         raise RuntimeError("SYMBOLS 沒有有效股票")
 
-    # 讀 PRICES 並建立 symbol 索引
+    # 讀 PRICES 並建立 (symbol,date) 索引
     ws_p = sh.worksheet(WS_PRICES)
-    sym_index, header = build_symbol_index(ws_p)
+    idx_map, header = build_symbol_date_index(ws_p)
 
     # 找欄位位置
     def col_idx(name):
@@ -169,21 +168,21 @@ def main():
             continue
 
         d, close, vol = res
+        key = (sym, d)
 
-        if sym in sym_index:
-            row_no = sym_index[sym]
-            # ✅ 覆蓋同一個 symbol 的那一列（Date/Close/Volume 都更新）
-            ws_p.update_cell(row_no, c_date, d)
+        # ✅ 同 Symbol + 同 Date：更新那一列（不動 Date/Symbol）
+        if key in idx_map:
+            row_no = idx_map[key]
             ws_p.update_cell(row_no, c_close, close)
             ws_p.update_cell(row_no, c_vol, vol)
             updated += 1
-            print(f"[UPD] {sym} row={row_no} date={d} close={close} vol(張)={vol}")
+            print(f"[UPD] {sym} date={d} row={row_no} close={close} vol(張)={vol}")
         else:
-            # ✅ 不存在就新增
+            # ✅ 不同 Date（或新股票）：新增一列，保留歷史
             ws_p.append_row([d, sym, close, vol], value_input_option="USER_ENTERED")
             appended += 1
-            # 新增後更新 index（避免同一輪再次新增）
-            sym_index[sym] = len(ws_p.get_all_values())
+            # 更新 index（避免同一輪重複新增）
+            idx_map[key] = len(ws_p.get_all_values())
             print(f"[APP] {sym} date={d} close={close} vol(張)={vol}")
 
         time.sleep(SLEEP_SEC)
