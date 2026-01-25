@@ -16,6 +16,15 @@ LOOKBACK_CAL_DAYS = 30
 SLEEP_SEC = 0.2
 
 
+def norm_market(m: str) -> str:
+    s = (m or "").strip().lower()
+    if s in ("otc", "two", "tpex", "上櫃", "櫃買", "興櫃"):
+        return "otc"
+    if s in ("tse", "twse", "上市", "tw"):
+        return "tse"
+    return s
+
+
 def get_client():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     scopes = [
@@ -30,8 +39,9 @@ def fetch_latest_yf(symbol: str, market: str):
     """
     return (date_str, close, vol_lots)
     vol_lots 一律「張」
-    date_str 用 YYYY-MM-DD（交易日）
+    date_str YYYY-MM-DD（交易日）
     """
+    market = norm_market(market)
     suffix = ".TW" if market == "tse" else ".TWO"
     ticker = f"{symbol}{suffix}"
 
@@ -49,7 +59,7 @@ def fetch_latest_yf(symbol: str, market: str):
         d = last.index[0].strftime("%Y-%m-%d")
         close = float(last["Close"].values[0])
         vol_shares = float(last["Volume"].values[0])
-        vol_lots = int(round(vol_shares / 1000.0))  # ✅ 一律張
+        vol_lots = int(round(vol_shares / 1000.0))
         return d, close, vol_lots
 
     end = dt.datetime.utcnow()
@@ -79,8 +89,7 @@ def fetch_latest_yf(symbol: str, market: str):
 
 def build_symbol_date_index(ws):
     """
-    建立 (symbol, date) -> row_number 的索引
-    row_number 是 Google Sheet 的實際列號（從 1 開始，含 header）
+    建立 (symbol, date) -> row_number
     """
     vals = ws.get_all_values()
     if not vals:
@@ -96,7 +105,6 @@ def build_symbol_date_index(ws):
     idx_date = header.index("date")
 
     index = {}
-    # 第1列 header，所以 data 從第2列開始
     for row_no, r in enumerate(rows, start=2):
         if len(r) <= max(idx_symbol, idx_date):
             continue
@@ -113,7 +121,7 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    # 讀 SYMBOLS
+    # SYMBOLS
     ws_sym = sh.worksheet(WS_SYMBOLS)
     sym_vals = ws_sym.get_all_values()
     if len(sym_vals) < 2:
@@ -123,36 +131,34 @@ def main():
     df = pd.DataFrame(sym_vals[1:], columns=sym_header)
 
     if "symbol" not in df.columns or "market" not in df.columns:
-        raise RuntimeError("SYMBOLS 必須包含 symbol, market（market=tse/otc）")
+        raise RuntimeError("SYMBOLS 必須包含 symbol, market")
 
     if "active" in df.columns:
         df = df[df["active"].astype(str).str.strip() != "0"]
 
     df["symbol"] = df["symbol"].astype(str).str.strip()
-    df["market"] = df["market"].astype(str).str.lower().str.strip()
+    df["market"] = df["market"].astype(str).map(norm_market)
     df = df[df["market"].isin(["tse", "otc"])]
 
     if df.empty:
         raise RuntimeError("SYMBOLS 沒有有效股票")
 
-    # 讀 PRICES 並建立 (symbol,date) 索引
+    # PRICES
     ws_p = sh.worksheet(WS_PRICES)
     idx_map, header = build_symbol_date_index(ws_p)
 
-    # 找欄位位置
     def col_idx(name):
         name = name.lower()
         if name not in header:
             return None
-        return header.index(name) + 1  # 轉成 1-based column
+        return header.index(name) + 1
 
     c_date = col_idx("date")
     c_symbol = col_idx("symbol")
     c_close = col_idx("close")
     c_vol = col_idx("volume")
-
     if None in (c_date, c_symbol, c_close, c_vol):
-        raise RuntimeError("PRICES 必須有 Date, Symbol, Close, Volume 欄位（大小寫不拘）")
+        raise RuntimeError("PRICES 必須有 Date, Symbol, Close, Volume")
 
     updated = 0
     appended = 0
@@ -170,7 +176,6 @@ def main():
         d, close, vol = res
         key = (sym, d)
 
-        # ✅ 同 Symbol + 同 Date：更新那一列（不動 Date/Symbol）
         if key in idx_map:
             row_no = idx_map[key]
             ws_p.update_cell(row_no, c_close, close)
@@ -178,10 +183,8 @@ def main():
             updated += 1
             print(f"[UPD] {sym} date={d} row={row_no} close={close} vol(張)={vol}")
         else:
-            # ✅ 不同 Date（或新股票）：新增一列，保留歷史
             ws_p.append_row([d, sym, close, vol], value_input_option="USER_ENTERED")
             appended += 1
-            # 更新 index（避免同一輪重複新增）
             idx_map[key] = len(ws_p.get_all_values())
             print(f"[APP] {sym} date={d} close={close} vol(張)={vol}")
 
@@ -192,3 +195,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
