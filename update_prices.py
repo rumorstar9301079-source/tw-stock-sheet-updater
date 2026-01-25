@@ -33,21 +33,13 @@ def get_client():
 # Market normalizer
 # -----------------------------
 def norm_market(v: str) -> str:
-    """
-    Normalize market to:
-      - 'tse'  (上市) -> suffix .TW
-      - 'otc'  (上櫃) -> suffix .TWO
-    Accepts many aliases.
-    """
     s = str(v or "").strip().lower()
     if not s:
         return "tse"
-
     if s in ("tse", "twse", "tw", "上市", "市", "listed"):
         return "tse"
-    if s in ("otc", "tpex", "two", "上櫃", "櫃買", "櫃", "unlisted"):
+    if s in ("otc", "tpex", "two", "上櫃", "櫃買", "櫃", "unlisted", "tpEx".lower()):
         return "otc"
-
     if any(k in s for k in ("otc", "tpex", "two", "上櫃", "櫃買")):
         return "otc"
     return "tse"
@@ -59,19 +51,16 @@ def norm_market(v: str) -> str:
 def fetch_latest_yf_try_both(symbol: str, market_hint: str):
     """
     return (date_str, close, vol_lots, market_used)
-    - vol_lots 一律「張」
-    - date_str 用交易日 YYYY-MM-DD
-    - market_used: 'tse' or 'otc' (based on suffix that worked)
+    - vol_lots: 張
+    - market_used: tse/otc (suffix that worked)
     """
     symbol = str(symbol).strip()
 
     def normalize(df):
         if df is None or df.empty:
             return None
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
-
         if "Close" not in df.columns or "Volume" not in df.columns:
             return None
 
@@ -79,7 +68,7 @@ def fetch_latest_yf_try_both(symbol: str, market_hint: str):
         d = last.index[0].strftime("%Y-%m-%d")
         close = float(last["Close"].values[0])
         vol_shares = float(last["Volume"].values[0])
-        vol_lots = int(round(vol_shares / 1000.0))  # ✅ 張
+        vol_lots = int(round(vol_shares / 1000.0))
         return d, close, vol_lots
 
     def try_ticker(ticker: str):
@@ -104,7 +93,6 @@ def fetch_latest_yf_try_both(symbol: str, market_hint: str):
         res = normalize(df2)
         if res:
             return res
-
         return None
 
     hint = norm_market(market_hint)
@@ -117,7 +105,6 @@ def fetch_latest_yf_try_both(symbol: str, market_hint: str):
         if res:
             d, close, vol = res
             return d, close, vol, mkt
-
     return None
 
 
@@ -125,10 +112,6 @@ def fetch_latest_yf_try_both(symbol: str, market_hint: str):
 # PRICES helpers
 # -----------------------------
 def build_prices_symbol_index(ws_prices):
-    """
-    Build symbol -> row_number map for PRICES sheet.
-    row_number is 1-based row index in Google Sheets.
-    """
     vals = ws_prices.get_all_values()
     if not vals:
         return {}, []
@@ -141,15 +124,12 @@ def build_prices_symbol_index(ws_prices):
 
     idx_symbol = header.index("symbol")
     sym_index = {}
-
     for row_no, r in enumerate(rows, start=2):
         if len(r) <= idx_symbol:
             continue
         sym = str(r[idx_symbol]).strip()
         if sym:
-            # 同 symbol 以最後一列為準
             sym_index[sym] = row_no
-
     return sym_index, header
 
 
@@ -164,10 +144,6 @@ def col_1based(header, name: str):
 # WATCHLIST reader + optional market writeback
 # -----------------------------
 def read_watchlist(ws_watch):
-    """
-    return: (items, header, idx_symbol, idx_market)
-    items: list of (row_no_1based, symbol, market_hint)
-    """
     vals = ws_watch.get_all_values()
     if len(vals) < 2:
         raise RuntimeError("WATCHLIST 沒有資料")
@@ -182,7 +158,7 @@ def read_watchlist(ws_watch):
     idx_market = header.index("market") if "market" in header else None
 
     items = []
-    for i, r in enumerate(rows, start=2):  # sheet row number
+    for i, r in enumerate(rows, start=2):  # sheet row
         if len(r) <= idx_symbol:
             continue
         sym = str(r[idx_symbol]).strip()
@@ -193,29 +169,46 @@ def read_watchlist(ws_watch):
             mkt = norm_market(r[idx_market])
         items.append((i, sym, mkt))
 
-    # 去重：同 symbol 以最後出現為準（避免重複更新）
+    # de-dup symbol (keep last)
     last = {}
     for row_no, sym, mkt in items:
         last[sym] = (row_no, mkt)
-
     out = [(last[sym][0], sym, last[sym][1]) for sym in last.keys()]
-    return out, header, idx_symbol, idx_market
+    return out, idx_market
 
 
 def batch_writeback_market(ws_watch, idx_market_0based, updates):
-    """
-    updates: list[(row_no_1based, market_used)]
-    Only writes when market column exists and differs.
-    """
     if idx_market_0based is None:
         return
-
-    col_market_1based = idx_market_0based + 1
-    cells = []
-    for row_no, mkt in updates:
-        cells.append(gspread.Cell(row_no, col_market_1based, mkt))
+    col_market = idx_market_0based + 1
+    cells = [gspread.Cell(r, col_market, m) for r, m in updates]
     if cells:
         ws_watch.update_cells(cells, value_input_option="USER_ENTERED")
+
+
+# -----------------------------
+# robust append (NO append_row)
+# -----------------------------
+def append_rows_by_update(ws, rows):
+    """
+    ✅ Avoid ws.append_row() because it may end up outside a Google Sheets 'Table' view.
+    This writes rows to the first empty row after existing sheet content.
+    """
+    if not rows:
+        return
+
+    # last_row includes header + data rows; stable for "data area"
+    start_row = ws.get_all_values().__len__() + 1  # next empty row
+    start_col = 1
+    num_rows = len(rows)
+    num_cols = len(rows[0])
+
+    # Write as a block (USER_ENTERED to keep number formats)
+    ws.update(
+        f"A{start_row}:{gspread.utils.rowcol_to_a1(start_row + num_rows - 1, start_col + num_cols - 1)}",
+        rows,
+        value_input_option="USER_ENTERED",
+    )
 
 
 # -----------------------------
@@ -229,33 +222,26 @@ def main():
     ws_watch = sh.worksheet(WS_WATCHLIST)
     ws_prices = sh.worksheet(WS_PRICES)
 
-    # 1) watchlist items
-    items, watch_header, idx_symbol, idx_market = read_watchlist(ws_watch)
+    items, idx_market = read_watchlist(ws_watch)
     if not items:
         raise RuntimeError("WATCHLIST 沒有有效 symbol")
 
-    # Debug: confirm watchlist contains your OTC symbols
     print("[DBG] WATCHLIST items:", [(sym, mkt) for _, sym, mkt in items])
 
-    # 2) PRICES index + columns
-    sym_index, prices_header = build_prices_symbol_index(ws_prices)
+    sym_index, header = build_prices_symbol_index(ws_prices)
 
-    c_date = col_1based(prices_header, "date")
-    c_symbol = col_1based(prices_header, "symbol")
-    c_close = col_1based(prices_header, "close")
-    c_vol = col_1based(prices_header, "volume")
-
+    c_date = col_1based(header, "date")
+    c_symbol = col_1based(header, "symbol")
+    c_close = col_1based(header, "close")
+    c_vol = col_1based(header, "volume")
     if None in (c_date, c_symbol, c_close, c_vol):
         raise RuntimeError("PRICES 必須有 Date, Symbol, Close, Volume 欄位（大小寫不拘）")
 
     updated = 0
     appended = 0
 
-    # Batch updates to PRICES
     price_cells = []
     append_rows = []
-
-    # Batch market writeback to WATCHLIST
     market_writebacks = []
 
     for row_no_watch, sym, market_hint in items:
@@ -267,7 +253,6 @@ def main():
 
         d, close, vol, market_used = res
 
-        # write back correct market to WATCHLIST (if differs)
         if norm_market(market_hint) != market_used:
             market_writebacks.append((row_no_watch, market_used))
 
@@ -279,20 +264,22 @@ def main():
             updated += 1
             print(f"[UPD] {sym} row={row_no} date={d} close={close} vol(張)={vol} marketUsed={market_used}")
         else:
+            # ✅ IMPORTANT: match PRICES header order: Date, Symbol, Close, Volume
             append_rows.append([d, sym, close, vol])
             appended += 1
             print(f"[APP] {sym} date={d} close={close} vol(張)={vol} marketUsed={market_used}")
 
         time.sleep(SLEEP_SEC)
 
-    # 3) commit PRICES updates
+    # commit updates
     if price_cells:
         ws_prices.update_cells(price_cells, value_input_option="USER_ENTERED")
 
-    for r in append_rows:
-        ws_prices.append_row(r, value_input_option="USER_ENTERED")
+    # ✅ commit appends using update() block, not append_row()
+    if append_rows:
+        append_rows_by_update(ws_prices, append_rows)
 
-    # 4) commit WATCHLIST market writebacks (optional)
+    # write back market if needed
     batch_writeback_market(ws_watch, idx_market, market_writebacks)
 
     print(f"[DONE] updated={updated}, appended={appended}")
