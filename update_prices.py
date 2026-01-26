@@ -1,7 +1,7 @@
 import os
 import json
 import datetime as dt
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -94,35 +94,108 @@ def ensure_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
     return header, {h.lower(): i for i, h in enumerate(header)}
 
 
+# =========================
+# ✅ WATCHLIST 讀取：支援
+# - 第 1 行放說明（表頭不一定在第 1 行）
+# - Symbol 欄：Symbol / 股票代碼 / 股票代號 / 代號 / 證券代號...
+# - Market 欄：Market / tse上市otc上櫃 / 上市otc上櫃 / 市場...
+# =========================
+def _norm(s: str) -> str:
+    return (s or "").replace("\u00a0", " ").strip().lower()
+
+
+def _col_index(header: List[str], key: str) -> int:
+    """
+    key: "symbol" / "market"
+    """
+    alias = {
+        "symbol": [
+            "symbol", "ticker", "stockno", "stock_no",
+            "代號", "股號", "股票代號", "股票代碼",
+            "證券代號", "證券代碼", "公司代號",
+        ],
+        "market": [
+            "market", "市場",
+            "上市/上櫃", "上市／上櫃", "上市上櫃",
+            "tse上市otc上櫃", "上市otc上櫃",
+            "tse上市 otc上櫃",  # 以防有空白
+        ],
+    }
+    candidates = [_norm(x) for x in alias.get(key, [key])]
+
+    for i, h in enumerate(header):
+        hh = _norm(h)
+        if not hh:
+            continue
+        if hh in candidates:
+            return i
+        # contains fallback（例如表頭含括號、或前後多字）
+        if any(c in hh or hh in c for c in candidates):
+            return i
+    return -1
+
+
+def _find_header_row(vals: List[List[str]], max_scan: int = 10) -> int:
+    """
+    掃描前 max_scan 列，找出最像表頭的那一列
+    規則：該列含 symbol/股票代碼/代號 任一字樣
+    """
+    keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
+    scan = vals[: min(max_scan, len(vals))]
+    for i, row in enumerate(scan):
+        text = "|".join(_norm(x) for x in row)
+        if any(_norm(k) in text for k in keys):
+            return i
+    return 0
+
+
+def _normalize_market(mkt: str) -> str:
+    m = _norm(mkt)
+    if m in ("otc", "tpex", "two"):
+        return "otc"
+    if m in ("tse", "twse", "tw", "上市"):
+        return "tse"
+    if "otc" in m or "tpex" in m or "上櫃" in m:
+        return "otc"
+    if "tse" in m or "twse" in m or "上市" in m:
+        return "tse"
+    return "tse"
+
+
 def read_watchlist(ws_watch) -> List[Tuple[str, str]]:
     """
     從 WATCHLIST 讀 Symbol/Market，回傳 [(symbol, market), ...]
+    - 支援第 1 行放說明：自動偵測表頭列
+    - Symbol 欄可為：Symbol/股票代碼/代號...
+    - Market 欄可為：Market/tse上市otc上櫃/市場...
     """
     vals = ws_watch.get_all_values()
     if len(vals) < 2:
         raise RuntimeError("WATCHLIST 沒有資料")
 
-    header = [h.strip().lower() for h in vals[0]]
-    rows = vals[1:]
+    hrow = _find_header_row(vals, max_scan=10)
+    header_raw = vals[hrow]
+    header = [_norm(h) for h in header_raw]
+    rows = vals[hrow + 1 :]
 
-    if "symbol" not in header:
-        raise RuntimeError("WATCHLIST 必須有 Symbol 欄位")
-    idx_symbol = header.index("symbol")
-    idx_market = header.index("market") if "market" in header else None
+    idx_symbol = _col_index(header_raw, "symbol")
+    if idx_symbol < 0:
+        raise RuntimeError("WATCHLIST 找不到 Symbol/股票代碼/代號 欄位（表頭可能不在前 10 列）")
 
-    out = []
+    idx_market = _col_index(header_raw, "market")  # may be -1
+
+    out: List[Tuple[str, str]] = []
     for r in rows:
         if len(r) <= idx_symbol:
             continue
         sym = str(r[idx_symbol]).strip()
         if not sym:
             continue
+
         mkt = ""
-        if idx_market is not None and len(r) > idx_market:
-            mkt = str(r[idx_market]).strip().lower()
-        # 預設 tse
-        if mkt not in ("tse", "otc"):
-            mkt = "tse"
+        if idx_market >= 0 and len(r) > idx_market:
+            mkt = str(r[idx_market]).strip()
+        mkt = _normalize_market(mkt)
         out.append((sym, mkt))
 
     # 去重（保留第一次出現）
@@ -148,11 +221,8 @@ def build_prices_index(ws_prices, header_map: Dict[str, int]) -> Tuple[Dict[Tupl
 
     idx_date = header_map.get("date")
     idx_symbol = header_map.get("symbol")
-    idx_close = header_map.get("close")
-    idx_vol = header_map.get("volume")
 
     index: Dict[Tuple[str, str], int] = {}
-    # data 從第2列開始
     for row_no, r in enumerate(vals[1:], start=2):
         if idx_date is None or idx_symbol is None:
             continue
@@ -162,7 +232,6 @@ def build_prices_index(ws_prices, header_map: Dict[str, int]) -> Tuple[Dict[Tupl
         s = str(r[idx_symbol]).strip()
         if not d or not s:
             continue
-        # 同 key 重複，以最後一筆為準
         index[(d, s)] = row_no
 
     return index, len(vals)
@@ -184,23 +253,21 @@ def main():
     idx_close = hmap.get("close")
     idx_volume = hmap.get("volume")
 
-    # 若缺 Close/Volume 欄位，補齊到 D 欄
-    #（最簡單方式：直接覆蓋成標準 4 欄表頭）
+    # 若缺 Close/Volume 欄位，補齊到 D 欄（直接覆蓋成標準 4 欄表頭）
     if idx_close is None or idx_volume is None:
         ws_prices.update("A1:D1", [PRICES_HEADERS])
         header = PRICES_HEADERS
         hmap = {h.lower(): i for i, h in enumerate(header)}
         idx_date, idx_symbol, idx_close, idx_volume = 0, 1, 2, 3
 
-    # 讀 watchlist
+    # 讀 watchlist（✅ 這裡已修好：不用一定叫 Symbol，表頭也不必在第 1 行）
     items = read_watchlist(ws_watch)
     print("[DBG] WATCHLIST items:", items)
 
     # 讀 PRICES index
     price_index, last_row = build_prices_index(ws_prices, hmap)
 
-    # 準備 batch 更新 / append
-    updates = []  # (rangeA1, [[...]])
+    updates = []   # (rangeA1, [[...]])
     new_rows = []  # [[date, symbol, close, vol_lots]]
 
     updated = 0
@@ -212,11 +279,9 @@ def main():
             print(f"[WARN] {sym}({mkt}) no data from Yahoo")
             continue
 
-        # 只保留最近約 90 個交易日（若你想更長就改這裡）
         df = df.tail(90)
 
         for dtt, row in df.iterrows():
-            # yfinance index 通常是日期（交易日），直接 format
             d_str = pd.to_datetime(dtt).strftime("%Y-%m-%d")
             close = float(row["Close"])
             vol_shares = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
@@ -225,9 +290,6 @@ def main():
             key = (d_str, sym)
             if key in price_index:
                 row_no = price_index[key]
-                # 只更新 Close/Volume（Date/Symbol 不動）
-                # Close: C欄，Volume: D欄（以 header_map 為準）
-                # 用 A1 range 更新同列兩格
                 col_close = idx_close + 1
                 col_vol = idx_volume + 1
                 a1 = gspread.utils.rowcol_to_a1(row_no, col_close)
@@ -239,15 +301,11 @@ def main():
                 new_rows.append([d_str, sym, close, vol_lots])
                 appended += 1
 
-    # 批次更新（一次丟多個 range）
     if updates:
-        # gspread batch_update needs list of dicts
         body = [{"range": rng, "values": vals} for rng, vals in updates]
         ws_prices.batch_update(body, value_input_option="USER_ENTERED")
 
-    # 批次 append（一次 append 多列）
     if new_rows:
-        # 依 Date, Symbol 排序，表比較乾淨
         new_rows.sort(key=lambda x: (x[0], x[1]))
         ws_prices.append_rows(new_rows, value_input_option="USER_ENTERED")
 
@@ -256,3 +314,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
