@@ -1,7 +1,7 @@
 import os
 import json
 import datetime as dt
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List
 
 import pandas as pd
 import yfinance as yf
@@ -118,7 +118,7 @@ def _col_index(header: List[str], key: str) -> int:
             "market", "市場",
             "上市/上櫃", "上市／上櫃", "上市上櫃",
             "tse上市otc上櫃", "上市otc上櫃",
-            "tse上市 otc上櫃",  # 以防有空白
+            "tse上市 otc上櫃",
         ],
     }
     candidates = [_norm(x) for x in alias.get(key, [key])]
@@ -129,7 +129,6 @@ def _col_index(header: List[str], key: str) -> int:
             continue
         if hh in candidates:
             return i
-        # contains fallback（例如表頭含括號、或前後多字）
         if any(c in hh or hh in c for c in candidates):
             return i
     return -1
@@ -175,8 +174,7 @@ def read_watchlist(ws_watch) -> List[Tuple[str, str]]:
 
     hrow = _find_header_row(vals, max_scan=10)
     header_raw = vals[hrow]
-    header = [_norm(h) for h in header_raw]
-    rows = vals[hrow + 1 :]
+    rows = vals[hrow + 1:]
 
     idx_symbol = _col_index(header_raw, "symbol")
     if idx_symbol < 0:
@@ -198,7 +196,6 @@ def read_watchlist(ws_watch) -> List[Tuple[str, str]]:
         mkt = _normalize_market(mkt)
         out.append((sym, mkt))
 
-    # 去重（保留第一次出現）
     seen = set()
     uniq = []
     for sym, mkt in out:
@@ -260,12 +257,10 @@ def main():
         hmap = {h.lower(): i for i, h in enumerate(header)}
         idx_date, idx_symbol, idx_close, idx_volume = 0, 1, 2, 3
 
-    # 讀 watchlist（✅ 這裡已修好：不用一定叫 Symbol，表頭也不必在第 1 行）
     items = read_watchlist(ws_watch)
     print("[DBG] WATCHLIST items:", items)
 
-    # 讀 PRICES index
-    price_index, last_row = build_prices_index(ws_prices, hmap)
+    price_index, _last_row = build_prices_index(ws_prices, hmap)
 
     updates = []   # (rangeA1, [[...]])
     new_rows = []  # [[date, symbol, close, vol_lots]]
@@ -273,11 +268,24 @@ def main():
     updated = 0
     appended = 0
 
+    # ✅ 台灣日期/時間（用 UTC+8 推算，不依賴系統時區）
+    now_tpe = dt.datetime.utcnow() + dt.timedelta(hours=8)
+    today_tpe = now_tpe.date()
+
     for sym, mkt in items:
         df = fetch_history_yf(sym, mkt)
         if df.empty:
             print(f"[WARN] {sym}({mkt}) no data from Yahoo")
             continue
+
+        # ✅ 檢查是否已包含「台灣今天」的日線資料（避免 Yahoo 還沒更新）
+        last_dt = pd.to_datetime(df.index.max())
+        last_date = last_dt.date()
+
+        if last_date < today_tpe and now_tpe.hour >= 20:
+            print(f"[WARN] {sym}({mkt}) Yahoo 尚未更新到今天：last_date={last_date}, today={today_tpe}")
+            # 若你想「沒更新到今天就不要寫入」，打開下一行：
+            # continue
 
         df = df.tail(90)
 
@@ -314,4 +322,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
