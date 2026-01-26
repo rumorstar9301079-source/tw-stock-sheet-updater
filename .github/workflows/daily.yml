@@ -30,15 +30,15 @@ jobs:
           LOOKBACK_CAL_DAYS: "120"
         run: python update_prices.py
 
-      - name: Run revenue updater
+      -  name: Run revenue updater
         env:
-          TZ: Asia/Taipei
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           WS_WATCHLIST: WATCHLIST
           WS_REVENUE: REVENUE
-          REVENUE_LOOKBACK_YEARS: "3"
+          REVENUE_FETCH_YEARS: "4"
+          REVENUE_KEEP_MONTHS: "36"
         run: python update_revenue.py
 
 
