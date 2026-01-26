@@ -3,7 +3,7 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 22 * * 1-5"
+    - cron: "15 22 * * 1-5"  # UTC 22:15 = Asia/Taipei 06:15 (Mon-Fri)
 
 jobs:
   run:
@@ -22,6 +22,7 @@ jobs:
 
       - name: Run price updater
         env:
+          TZ: Asia/Taipei
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           WS_WATCHLIST: WATCHLIST
@@ -31,10 +32,14 @@ jobs:
 
       - name: Run revenue updater
         env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          WS_REVENUE: REVENUE
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TZ: Asia/Taipei
           SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          WS_WATCHLIST: WATCHLIST
+          WS_REVENUE: REVENUE
+          REVENUE_LOOKBACK_YEARS: "3"
         run: python update_revenue.py
+
 
 
