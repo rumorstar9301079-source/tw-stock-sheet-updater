@@ -1,0 +1,43 @@
+name: run
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 22 * * 1-5"  # UTC 22:15 = Asia/Taipei 06:15 (Mon-Fri)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -q yfinance gspread google-auth pandas requests
+
+      - name: Run price updater
+        env:
+          TZ: Asia/Taipei
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WS_WATCHLIST: WATCHLIST
+          WS_PRICES: PRICES
+          LOOKBACK_CAL_DAYS: "120"
+        run: python update_prices.py
+
+      - name: Run revenue updater
+        env:
+          TZ: Asia/Taipei
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WS_WATCHLIST: WATCHLIST
+          WS_REVENUE: REVENUE
+          REVENUE_FETCH_YEARS: "4"
+          REVENUE_KEEP_MONTHS: "36"
+        run: python update_revenue.py
