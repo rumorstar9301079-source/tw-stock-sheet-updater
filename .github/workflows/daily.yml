@@ -3,7 +3,7 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 22 * * 1-5"  # 台灣時間 06:15（UTC+8）= UTC 22:15（前一日）
+    - cron: "15 22 * * 1-5"
 
 jobs:
   run:
@@ -18,16 +18,23 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -q yfinance gspread google-auth pandas
+        run: pip install -q yfinance gspread google-auth pandas requests
 
-      - name: Run updater
+      - name: Run price updater
         env:
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # 可選：如果你分頁名稱不同才需要
           WS_WATCHLIST: WATCHLIST
           WS_PRICES: PRICES
-          # 可選：想抓更長日曆天（預設 120）
           LOOKBACK_CAL_DAYS: "120"
         run: python update_prices.py
+
+      - name: Run revenue updater
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          WS_REVENUE: REVENUE
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+        run: python update_revenue.py
+
 
