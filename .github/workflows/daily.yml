@@ -2,8 +2,8 @@ name: run
 
 on:
   workflow_dispatch:
-schedule:
-  - cron: "15 8 * * 1-5"   # UTC 08:15 = Asia/Taipei 16:15 (Mon-Fri)
+  schedule:
+     - cron: "15 8 * * 1-5"   # UTC 08:15 = Asia/Taipei 16:15 (Mon-Fri)
 
 
 jobs:
