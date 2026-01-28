@@ -37,40 +37,62 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _norm(s: str) -> str:
+    return (s or "").replace("\u00a0", " ").strip().lower()
+
+
+def _norm_symbol(sym: str) -> str:
+    s = str(sym or "").strip().upper()
+    s = s.replace(".TW", "").replace(".TWO", "").replace(".TPE", "")
+    # 去掉 2330.0 這種
+    if s.endswith(".0") and s.replace(".", "", 1).isdigit():
+        s = s[:-2]
+    return s
+
+
 def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
     """
     取近 LOOKBACK_CAL_DAYS 日曆天的日線資料，回傳 DataFrame:
     index = datetime (交易日)
     columns = Close, Volume (Volume = shares)
+
+    ✅ 改成「永遠自動嘗試 .TW / .TWO」
+    - 不再依賴 WATCHLIST 的 market 是否正確
+    - market 只決定優先順序
     """
-    market = (market or "").strip().lower()
-    suffix = ".TWO" if market == "otc" else ".TW"  # 預設 tse
-    ticker = f"{symbol}{suffix}"
+    symbol = _norm_symbol(symbol)
 
     end = dt.datetime.utcnow()
     start = end - dt.timedelta(days=LOOKBACK_CAL_DAYS)
 
-    df = yf.download(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
-        interval="1d",
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-        group_by="column",
-    )
-    df = _normalize_cols(df)
-    if df is None or df.empty:
-        return pd.DataFrame()
+    m = _norm(market)
+    prefer = [f"{symbol}.TWO", f"{symbol}.TW"] if m == "otc" else [f"{symbol}.TW", f"{symbol}.TWO"]
 
-    need = {"Close", "Volume"}
-    if not need.issubset(set(df.columns)):
-        return pd.DataFrame()
+    for ticker in prefer:
+        df = yf.download(
+            ticker,
+            start=start.strftime("%Y-%m-%d"),
+            end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+            group_by="column",
+        )
+        df = _normalize_cols(df)
+        if df is None or df.empty:
+            continue
 
-    df = df[["Close", "Volume"]].copy()
-    df = df.dropna(subset=["Close"])
-    return df
+        need = {"Close", "Volume"}
+        if not need.issubset(set(df.columns)):
+            continue
+
+        df = df[["Close", "Volume"]].copy()
+        df = df.dropna(subset=["Close"])
+        if not df.empty:
+            return df
+
+    return pd.DataFrame()
 
 
 def ensure_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
@@ -86,7 +108,6 @@ def ensure_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
     header = [h.strip() for h in vals[0]]
     lower = [h.lower() for h in header]
     if "date" not in lower or "symbol" not in lower:
-        # 表頭亂掉：直接覆蓋第一列
         ws_prices.update("A1:D1", [PRICES_HEADERS])
         header = PRICES_HEADERS
         return header, {h.lower(): i for i, h in enumerate(header)}
@@ -100,10 +121,6 @@ def ensure_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
 # - Symbol 欄：Symbol / 股票代碼 / 股票代號 / 代號 / 證券代號...
 # - Market 欄：Market / tse上市otc上櫃 / 上市otc上櫃 / 市場...
 # =========================
-def _norm(s: str) -> str:
-    return (s or "").replace("\u00a0", " ").strip().lower()
-
-
 def _col_index(header: List[str], key: str) -> int:
     """
     key: "symbol" / "market"
@@ -186,7 +203,7 @@ def read_watchlist(ws_watch) -> List[Tuple[str, str]]:
     for r in rows:
         if len(r) <= idx_symbol:
             continue
-        sym = str(r[idx_symbol]).strip()
+        sym = _norm_symbol(str(r[idx_symbol]).strip())
         if not sym:
             continue
 
@@ -226,7 +243,7 @@ def build_prices_index(ws_prices, header_map: Dict[str, int]) -> Tuple[Dict[Tupl
         if len(r) <= max(idx_date, idx_symbol):
             continue
         d = str(r[idx_date]).strip()
-        s = str(r[idx_symbol]).strip()
+        s = _norm_symbol(str(r[idx_symbol]).strip())
         if not d or not s:
             continue
         index[(d, s)] = row_no
@@ -275,7 +292,7 @@ def main():
     for sym, mkt in items:
         df = fetch_history_yf(sym, mkt)
         if df.empty:
-            print(f"[WARN] {sym}({mkt}) no data from Yahoo")
+            print(f"[WARN] {sym}({mkt}) no data from Yahoo (.TW/.TWO tried)")
             continue
 
         # ✅ 檢查是否已包含「台灣今天」的日線資料（避免 Yahoo 還沒更新）
@@ -295,7 +312,9 @@ def main():
             vol_shares = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
             vol_lots = int(round(vol_shares / 1000.0))
 
-            key = (d_str, sym)
+            sym_key = _norm_symbol(sym)
+            key = (d_str, sym_key)
+
             if key in price_index:
                 row_no = price_index[key]
                 col_close = idx_close + 1
@@ -306,7 +325,7 @@ def main():
                 updates.append((rng, [[close, vol_lots]]))
                 updated += 1
             else:
-                new_rows.append([d_str, sym, close, vol_lots])
+                new_rows.append([d_str, sym_key, close, vol_lots])
                 appended += 1
 
     if updates:
@@ -322,5 +341,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
