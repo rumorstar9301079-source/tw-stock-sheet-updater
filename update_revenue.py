@@ -17,9 +17,8 @@ REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
-# 近 3 年要算 YoY / YoY3M，至少需要再多 12 個月當基期 + 2 個月湊 3M
-# 這裡抓 4 年比較保險
-FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "4"))
+# 抓多一點用來算 YoY/YoY3M
+FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "6"))
 KEEP_MONTHS = int(os.getenv("REVENUE_KEEP_MONTHS", "36"))
 
 
@@ -88,12 +87,10 @@ def read_watchlist_symbols(ws_watch) -> List[str]:
         sym = str(r[idx_symbol]).strip()
         if not sym:
             continue
-        # 去掉 2330.0 這種
         if sym.endswith(".0") and sym.replace(".", "", 1).isdigit():
             sym = sym[:-2]
         out.append(sym)
 
-    # unique keep order
     seen = set()
     uniq = []
     for s in out:
@@ -143,15 +140,12 @@ def build_revenue_index(ws_rev, hmap: Dict[str, int]) -> Tuple[Dict[Tuple[str, s
     return idx, len(vals)
 
 
-def _month_label(y: int, m: int) -> str:
-    # 你 REVENUE 分頁的格式：2023/1月/
-    return f"{y}/{m}月/"
-
-
 def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     """
-    ✅ 重要：FinMind 的 date 常是「公告/資料日期」，不是營收月份
-    所以 Month 必須用 revenue_year + revenue_month，避免整體 +1 月。
+    ✅ Month 一律使用「營收月份」口徑：
+    - 優先用 revenue_year + revenue_month（若存在且有效）
+    - 若缺，改用 date（公告/資料日期）但 Month = (date 的月份 - 1 個月)
+    這樣就不會出現 2025-12 營收被標成 2026-01。
     """
     if not FINMIND_TOKEN:
         raise RuntimeError("FINMIND_TOKEN 未設定（請放到 GitHub Secrets: FINMIND_TOKEN）")
@@ -174,49 +168,50 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
-    # ✅ 優先用營收年月（最準）
+    used_year_month = False
+
+    # 1) 優先用 revenue_year + revenue_month（最準）
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
         m = pd.to_numeric(df["revenue_month"], errors="coerce")
         ok = y.notna() & m.notna()
-        df = df[ok].copy()
-        df["RevenueYear"] = y.astype(int)
-        df["RevenueMonth"] = m.astype(int)
-        df["Month"] = df.apply(lambda r: _month_label(int(r["RevenueYear"]), int(r["RevenueMonth"])), axis=1)
-    else:
-        # fallback（不建議；僅避免 API schema 異常時整支報錯）
+        if ok.any():
+            df = df[ok].copy()
+            df["Month"] = (
+                y[ok].astype(int).astype(str)
+                + "-"
+                + m[ok].astype(int).astype(str).str.zfill(2)
+            )
+            used_year_month = True
+
+    # 2) fallback 用 date，但扣回 1 個月（公告月 → 營收月）
+    if not used_year_month:
         if "date" not in df.columns:
             return pd.DataFrame()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).copy()
-        df["Month"] = df["date"].dt.year.astype(int).astype(str) + "/" + df["date"].dt.month.astype(int).astype(str) + "月/"
+        d = pd.to_datetime(df["date"], errors="coerce")
+        ok = d.notna()
+        df = df[ok].copy()
+        d = d[ok]
+        df["Month"] = (d.dt.to_period("M") - 1).astype(str)  # "YYYY-MM"
 
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0).astype("int64")
     df["Symbol"] = str(symbol)
 
     df = df[["Month", "Symbol", "Revenue"]].drop_duplicates(subset=["Month", "Symbol"])
-    # 依年月排序：Month 是 "YYYY/M月/"，用 PeriodIndex 來穩定排序
-    tmp = df["Month"].str.replace("月/", "", regex=False)
-    # tmp: "YYYY/M"
-    df["_period"] = pd.PeriodIndex(tmp, freq="M")
-    df = df.sort_values(["Symbol", "_period"]).drop(columns=["_period"]).reset_index(drop=True)
+    df = df.sort_values(["Symbol", "Month"]).reset_index(drop=True)
     return df
 
 
 def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
     """
-    df columns: Month(YYYY/M月/), Symbol, Revenue (sorted)
+    df columns: Month(YYYY-MM), Symbol, Revenue (sorted by Month)
     YoY   = Revenue / Revenue(12M ago) - 1
     YoY3M = sum(Revenue last 3M) / sum(Revenue same 3M last year) - 1
     """
     if df.empty:
         return df
 
-    # Month -> period index
-    # Month "YYYY/M月/" -> "YYYY/M"
-    mm = df["Month"].astype(str).str.replace("月/", "", regex=False)
-    df["Period"] = pd.PeriodIndex(mm, freq="M")
-
+    df["Period"] = pd.PeriodIndex(df["Month"], freq="M")
     rev_map = dict(zip(df["Period"], df["Revenue"]))
 
     yoy = []
@@ -257,20 +252,21 @@ def main():
 
     # ensure header
     _ = ensure_revenue_header(ws_rev)
-    # 固定只用 A~E（不新增欄），覆蓋表頭避免對不到
     ws_rev.update("A1:E1", [REVENUE_HEADERS])
     hmap = {h.lower(): i for i, h in enumerate(REVENUE_HEADERS)}
 
     rev_index, _ = build_revenue_index(ws_rev, hmap)
-
     symbols = read_watchlist_symbols(ws_watch)
     print("[DBG] WATCHLIST symbols:", symbols)
 
     today = dt.date.today()
     start_date = (today.replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
 
-    updates = []   # (rangeA1, [[...]]))
-    new_rows = []  # [[Month, Symbol, Revenue, YoY, YoY3M]]
+    # ✅ 可用營收月份：本月 - 1（避免未公告月份提前寫入）
+    latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
+
+    updates = []
+    new_rows = []
 
     i_rev = hmap["revenue"]
     i_yoy = hmap["yoy"]
@@ -282,17 +278,20 @@ def main():
             print(f"[WARN] {sym} no revenue data")
             continue
 
+        # ✅ 不寫入未公告月份（例如 2026-01 還沒公告，就不應該出現）
+        df = df[df["Month"] <= latest_ok].copy()
+        if df.empty:
+            continue
+
+        df = df.sort_values("Month").reset_index(drop=True)
         df = compute_yoy_fields(df)
 
         # 只保留近 36 個月（YoY/YoY3M 已用更長歷史算完）
-        # 這裡用 Period 排序/截斷更安全
-        mm = df["Month"].astype(str).str.replace("月/", "", regex=False)
-        df["_period"] = pd.PeriodIndex(mm, freq="M")
-        df = df.sort_values("_period").tail(KEEP_MONTHS).drop(columns=["_period"]).reset_index(drop=True)
+        df = df.sort_values("Month").tail(KEEP_MONTHS).reset_index(drop=True)
 
         for _, r in df.iterrows():
-            month = str(r["Month"]).strip()
-            symbol = str(r["Symbol"]).strip()
+            month = str(r["Month"])
+            symbol = str(r["Symbol"])
             revenue = int(r["Revenue"])
 
             yoy = r["YoY"]
@@ -304,7 +303,6 @@ def main():
             key = (month, symbol)
             if key in rev_index:
                 row_no = rev_index[key]
-                # 更新 C~E（Revenue/YoY/YoY3M）
                 c1 = gspread.utils.rowcol_to_a1(row_no, i_rev + 1)
                 e1 = gspread.utils.rowcol_to_a1(row_no, i_yoy3m + 1)
                 rng = f"{c1}:{e1}"
@@ -317,14 +315,8 @@ def main():
         ws_rev.batch_update(body, value_input_option="USER_ENTERED")
 
     if new_rows:
-        # 排序讓表格好看：用 period 排序
-        def _sort_key(x):
-            # x[0] = "YYYY/M月/"
-            s = str(x[0]).replace("月/", "")
-            p = pd.Period(s, freq="M")
-            return (p.year, p.month, x[1])
-
-        new_rows.sort(key=_sort_key)
+        # 排序讓表格好看：先月再代號
+        new_rows.sort(key=lambda x: (x[0], x[1]))
         ws_rev.append_rows(new_rows, value_input_option="USER_ENTERED")
 
     print(f"[DONE] updated={len(updates)}, appended={len(new_rows)}")
@@ -332,3 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
