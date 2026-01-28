@@ -1,7 +1,7 @@
 import os
 import json
 import datetime as dt
-from typing import Dict, Tuple, List
+from typing import List
 
 import pandas as pd
 import requests
@@ -17,7 +17,6 @@ REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
-# 抓多一點用來算 YoY/YoY3M
 FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "6"))
 KEEP_MONTHS = int(os.getenv("REVENUE_KEEP_MONTHS", "36"))
 
@@ -91,6 +90,7 @@ def read_watchlist_symbols(ws_watch) -> List[str]:
             sym = sym[:-2]
         out.append(sym)
 
+    # unique keep order
     seen = set()
     uniq = []
     for s in out:
@@ -101,51 +101,11 @@ def read_watchlist_symbols(ws_watch) -> List[str]:
     return uniq
 
 
-def ensure_revenue_header(ws_rev) -> Dict[str, int]:
-    vals = ws_rev.get_all_values()
-    if not vals:
-        ws_rev.append_row(REVENUE_HEADERS)
-        return {h.lower(): i for i, h in enumerate(REVENUE_HEADERS)}
-
-    header = [str(x).strip() for x in vals[0]]
-    lower = [h.lower() for h in header]
-
-    need = [h.lower() for h in REVENUE_HEADERS]
-    if any(h not in lower for h in need):
-        ws_rev.update("A1:E1", [REVENUE_HEADERS])
-        return {h.lower(): i for i, h in enumerate(REVENUE_HEADERS)}
-
-    return {h.lower(): i for i, h in enumerate(header)}
-
-
-def build_revenue_index(ws_rev, hmap: Dict[str, int]) -> Tuple[Dict[Tuple[str, str], int], int]:
-    vals = ws_rev.get_all_values()
-    if not vals:
-        return {}, 1
-
-    i_month = hmap.get("month")
-    i_sym = hmap.get("symbol")
-    if i_month is None or i_sym is None:
-        return {}, len(vals)
-
-    idx: Dict[Tuple[str, str], int] = {}
-    for row_no, r in enumerate(vals[1:], start=2):
-        if len(r) <= max(i_month, i_sym):
-            continue
-        m = str(r[i_month]).strip()
-        s = str(r[i_sym]).strip()
-        if not m or not s:
-            continue
-        idx[(m, s)] = row_no
-    return idx, len(vals)
-
-
 def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     """
-    ✅ Month 一律使用「營收月份」口徑：
-    - 優先用 revenue_year + revenue_month（若存在且有效）
-    - 若缺，改用 date（公告/資料日期）但 Month = (date 的月份 - 1 個月)
-    這樣就不會出現 2025-12 營收被標成 2026-01。
+    Month 一律以「營收月份」口徑：
+    - 優先 revenue_year + revenue_month（若有且有效）
+    - 否則用 date（公告/資料日），並回推 1 個月當營收月
     """
     if not FINMIND_TOKEN:
         raise RuntimeError("FINMIND_TOKEN 未設定（請放到 GitHub Secrets: FINMIND_TOKEN）")
@@ -168,9 +128,8 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
+    # --- Month 生成 ---
     used_year_month = False
-
-    # 1) 優先用 revenue_year + revenue_month（最準）
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
         m = pd.to_numeric(df["revenue_month"], errors="coerce")
@@ -184,7 +143,6 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
             )
             used_year_month = True
 
-    # 2) fallback 用 date，但扣回 1 個月（公告月 → 營收月）
     if not used_year_month:
         if "date" not in df.columns:
             return pd.DataFrame()
@@ -192,7 +150,8 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
-        df["Month"] = (d.dt.to_period("M") - 1).astype(str)  # "YYYY-MM"
+        # 公告月 -> 營收月
+        df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0).astype("int64")
     df["Symbol"] = str(symbol)
@@ -204,21 +163,18 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
 
 def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
     """
-    df columns: Month(YYYY-MM), Symbol, Revenue (sorted by Month)
-    YoY   = Revenue / Revenue(12M ago) - 1
-    YoY3M = sum(Revenue last 3M) / sum(Revenue same 3M last year) - 1
+    df: Month(YYYY-MM), Symbol, Revenue（同一 Symbol）
     """
     if df.empty:
         return df
 
+    df = df.sort_values("Month").reset_index(drop=True)
     df["Period"] = pd.PeriodIndex(df["Month"], freq="M")
     rev_map = dict(zip(df["Period"], df["Revenue"]))
 
-    yoy = []
-    yoy3m = []
+    yoy, yoy3m = [], []
     for p, rev in zip(df["Period"], df["Revenue"]):
-        p12 = p - 12
-        base = rev_map.get(p12, None)
+        base = rev_map.get(p - 12, None)
         if base is None or base == 0:
             yoy.append("")
         else:
@@ -229,8 +185,7 @@ def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
         if any(v is None for v in cur3) or any(v is None for v in pre3):
             yoy3m.append("")
         else:
-            s_cur = sum(cur3)
-            s_pre = sum(pre3)
+            s_cur, s_pre = sum(cur3), sum(pre3)
             if s_pre == 0:
                 yoy3m.append("")
             else:
@@ -238,8 +193,7 @@ def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
 
     df["YoY"] = yoy
     df["YoY3M"] = yoy3m
-    df = df.drop(columns=["Period"])
-    return df
+    return df.drop(columns=["Period"])
 
 
 def main():
@@ -250,12 +204,6 @@ def main():
     ws_watch = sh.worksheet(SHEET_WATCHLIST)
     ws_rev = sh.worksheet(SHEET_REVENUE)
 
-    # ensure header
-    _ = ensure_revenue_header(ws_rev)
-    ws_rev.update("A1:E1", [REVENUE_HEADERS])
-    hmap = {h.lower(): i for i, h in enumerate(REVENUE_HEADERS)}
-
-    rev_index, _ = build_revenue_index(ws_rev, hmap)
     symbols = read_watchlist_symbols(ws_watch)
     print("[DBG] WATCHLIST symbols:", symbols)
 
@@ -265,12 +213,7 @@ def main():
     # ✅ 可用營收月份：本月 - 1（避免未公告月份提前寫入）
     latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
 
-    updates = []
-    new_rows = []
-
-    i_rev = hmap["revenue"]
-    i_yoy = hmap["yoy"]
-    i_yoy3m = hmap["yoy3m"]
+    all_rows = []
 
     for sym in symbols:
         df = finmind_month_revenue(sym, start_date=start_date)
@@ -278,49 +221,36 @@ def main():
             print(f"[WARN] {sym} no revenue data")
             continue
 
-        # ✅ 不寫入未公告月份（例如 2026-01 還沒公告，就不應該出現）
+        # 不寫入未公告月份
         df = df[df["Month"] <= latest_ok].copy()
         if df.empty:
             continue
 
-        df = df.sort_values("Month").reset_index(drop=True)
         df = compute_yoy_fields(df)
 
-        # 只保留近 36 個月（YoY/YoY3M 已用更長歷史算完）
+        # 只留近 KEEP_MONTHS
         df = df.sort_values("Month").tail(KEEP_MONTHS).reset_index(drop=True)
 
+        # 組成要寫入的 rows
         for _, r in df.iterrows():
-            month = str(r["Month"])
-            symbol = str(r["Symbol"])
-            revenue = int(r["Revenue"])
+            yoy = "" if r["YoY"] == "" else float(r["YoY"])
+            yoy3m = "" if r["YoY3M"] == "" else float(r["YoY3M"])
+            all_rows.append([str(r["Month"]), str(r["Symbol"]), int(r["Revenue"]), yoy, yoy3m])
 
-            yoy = r["YoY"]
-            yoy3m = r["YoY3M"]
+    # 全表排序：先 Month 再 Symbol
+    all_rows.sort(key=lambda x: (x[0], x[1]))
 
-            v_yoy = "" if yoy == "" else float(yoy)
-            v_yoy3m = "" if yoy3m == "" else float(yoy3m)
+    # ✅ 重建 REVENUE：清掉舊錯月份列（例如 2026-01 其實是 2025-12）
+    ws_rev.clear()
+    ws_rev.update("A1:E1", [REVENUE_HEADERS])
+    if all_rows:
+        ws_rev.append_rows(all_rows, value_input_option="USER_ENTERED")
 
-            key = (month, symbol)
-            if key in rev_index:
-                row_no = rev_index[key]
-                c1 = gspread.utils.rowcol_to_a1(row_no, i_rev + 1)
-                e1 = gspread.utils.rowcol_to_a1(row_no, i_yoy3m + 1)
-                rng = f"{c1}:{e1}"
-                updates.append((rng, [[revenue, v_yoy, v_yoy3m]]))
-            else:
-                new_rows.append([month, symbol, revenue, v_yoy, v_yoy3m])
+    print(f"[DONE] rebuilt rows={len(all_rows)} latest_ok={latest_ok}")
 
-    if updates:
-        body = [{"range": rng, "values": vals} for rng, vals in updates]
-        ws_rev.batch_update(body, value_input_option="USER_ENTERED")
 
-    if new_rows:
-        # 排序讓表格好看：先月再代號
-        new_rows.sort(key=lambda x: (x[0], x[1]))
-        ws_rev.append_rows(new_rows, value_input_option="USER_ENTERED")
-
-    print(f"[DONE] updated={len(updates)}, appended={len(new_rows)}")
-
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
