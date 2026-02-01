@@ -9,13 +9,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ✅ 來源：SECTOR_MAP_MASTER_ALL_PLUS（用來取 Symbol 清單）
-SHEET_SOURCE = os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS")
-SHEET_PRICES = os.getenv("WS_PRICES", "PRICES")
+# ✅ 不再用 WS_WATCHLIST（避免 workflow 把它覆蓋成 WATCHLIST）
+SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "SECTOR_MAP_MASTER_ALL_PLUS").strip()
+SHEET_PRICES = os.getenv("WS_PRICES", "PRICES").strip()
 
 LOOKBACK_CAL_DAYS = int(os.getenv("LOOKBACK_CAL_DAYS", "120"))
-
-# PRICES 必須有這四欄（你截圖是對的）
 REQUIRED_HEADERS = ["Date", "Symbol", "Close", "Volume"]
 
 
@@ -50,7 +48,6 @@ def _norm_symbol(sym: str) -> str:
 
 
 def _norm_date_str(x: str) -> str:
-    """把 Google Sheet 可能出現的日期格式統一成 YYYY-MM-DD"""
     s = str(x or "").strip()
     if not s:
         return ""
@@ -64,10 +61,6 @@ def _norm_date_str(x: str) -> str:
 
 
 def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
-    """
-    取近 LOOKBACK_CAL_DAYS 日曆天的日線資料（yfinance Volume=股數）
-    - 永遠嘗試 .TW / .TWO
-    """
     symbol = _norm_symbol(symbol)
 
     end = dt.datetime.utcnow()
@@ -90,9 +83,7 @@ def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
         df = _normalize_cols(df)
         if df is None or df.empty:
             continue
-
-        need = {"Close", "Volume"}
-        if not need.issubset(set(df.columns)):
+        if not {"Close", "Volume"}.issubset(set(df.columns)):
             continue
 
         df = df[["Close", "Volume"]].copy()
@@ -104,7 +95,6 @@ def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
 
 
 def get_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
-    """讀 PRICES 第 1 列當表頭，回傳 (header原樣, header_map小寫->index)"""
     vals = ws_prices.get_all_values()
     if not vals:
         raise RuntimeError("PRICES 沒有任何資料（至少要有表頭列）")
@@ -120,7 +110,6 @@ def get_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
 
 
 def build_prices_index_from_vals(vals: List[List[str]], hmap: Dict[str, int]) -> Dict[Tuple[str, str], int]:
-    """index: (YYYY-MM-DD, SYMBOL) -> sheet_row_no(1-based)"""
     if len(vals) < 2:
         return {}
 
@@ -139,9 +128,17 @@ def build_prices_index_from_vals(vals: List[List[str]], hmap: Dict[str, int]) ->
     return index
 
 
-# =========================
-# ✅ 來源表（SECTOR_MAP...）讀取
-# =========================
+# ======= 來源表讀 Symbol（SECTOR_MAP_MASTER_ALL_PLUS） =======
+def _find_header_row(vals: List[List[str]], max_scan: int = 60) -> int:
+    keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
+    scan = vals[: min(max_scan, len(vals))]
+    for i, row in enumerate(scan):
+        text = "|".join(_norm(x) for x in row)
+        if any(_norm(k) in text for k in keys):
+            return i
+    return 0
+
+
 def _col_index(header: List[str], key: str) -> int:
     alias = {
         "symbol": [
@@ -157,7 +154,6 @@ def _col_index(header: List[str], key: str) -> int:
         ],
     }
     candidates = [_norm(x) for x in alias.get(key, [key])]
-
     for i, h in enumerate(header):
         hh = _norm(h)
         if not hh:
@@ -169,53 +165,32 @@ def _col_index(header: List[str], key: str) -> int:
     return -1
 
 
-def _find_header_row(vals: List[List[str]], max_scan: int = 40) -> int:
-    keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
-    scan = vals[: min(max_scan, len(vals))]
-    for i, row in enumerate(scan):
-        text = "|".join(_norm(x) for x in row)
-        if any(_norm(k) in text for k in keys):
-            return i
-    return 0
-
-
 def _normalize_market(mkt: str) -> str:
     m = _norm(mkt)
-    if m in ("otc", "tpex", "two"):
+    if m in ("otc", "tpex", "two") or "上櫃" in m:
         return "otc"
-    if m in ("tse", "twse", "tw", "上市"):
-        return "tse"
-    if "otc" in m or "tpex" in m or "上櫃" in m:
-        return "otc"
-    if "tse" in m or "twse" in m or "上市" in m:
-        return "tse"
     return "tse"
 
 
 def read_source_items(ws_source) -> List[Tuple[str, str]]:
-    """
-    回傳 [(Symbol, market)]，market 欄若不存在則預設 tse
-    ✅ Symbol 去重（同股多族群只抓一次）
-    """
     vals = ws_source.get_all_values()
     if len(vals) < 2:
-        raise RuntimeError(f"{SHEET_SOURCE} 沒有資料")
+        raise RuntimeError(f"{ws_source.title} 沒有資料")
 
-    hrow = _find_header_row(vals, max_scan=40)
-    header_raw = vals[hrow]
+    hrow = _find_header_row(vals, max_scan=60)
+    header = vals[hrow]
     rows = vals[hrow + 1:]
 
-    idx_symbol = _col_index(header_raw, "symbol")
+    idx_symbol = _col_index(header, "symbol")
     if idx_symbol < 0:
-        raise RuntimeError(f"{SHEET_SOURCE} 找不到 Symbol/股票代碼/代號 欄位（表頭可能不在前 40 列）")
+        raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 60 列）")
 
-    idx_market = _col_index(header_raw, "market")  # may be -1
+    idx_market = _col_index(header, "market")  # 可沒有
 
     out: List[Tuple[str, str]] = []
     for r in rows:
         if len(r) <= idx_symbol:
             continue
-
         sym = _norm_symbol(r[idx_symbol])
         if not sym:
             continue
@@ -226,15 +201,23 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
         mkt = _normalize_market(mkt)
         out.append((sym, mkt))
 
+    # ✅ Symbol 去重（同股多族群只抓一次）
     seen = set()
     uniq = []
     for sym, mkt in out:
-        key = sym  # ✅ 只以 Symbol 去重（避免同股不同 market 造成重複）
-        if key in seen:
+        if sym in seen:
             continue
-        seen.add(key)
+        seen.add(sym)
         uniq.append((sym, mkt))
     return uniq
+
+
+def _open_ws_by_title_strip(sh, title: str):
+    target = (title or "").strip()
+    for ws in sh.worksheets():
+        if ws.title.strip() == target:
+            return ws
+    raise gspread.exceptions.WorksheetNotFound(f"Worksheet not found: {title}")
 
 
 def main():
@@ -242,44 +225,45 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    ws_source = sh.worksheet(SHEET_SOURCE)
-    ws_prices = sh.worksheet(SHEET_PRICES)
+    # ✅ 先列出所有工作表（讓你直接看是不是名字有空白/不同）
+    all_titles = [ws.title for ws in sh.worksheets()]
+    print("[DBG] worksheets:", all_titles)
+    print("[DBG] SHEET_SOURCE=", SHEET_SOURCE, "SHEET_PRICES=", SHEET_PRICES)
 
-    # ✅ 讀 PRICES 表頭
+    # ✅ 用 strip 匹配工作表名稱（避免尾巴空白）
+    ws_source = _open_ws_by_title_strip(sh, SHEET_SOURCE)
+    ws_prices = _open_ws_by_title_strip(sh, SHEET_PRICES)
+
     header, hmap = get_prices_header(ws_prices)
     i_date = hmap["date"]
     i_sym = hmap["symbol"]
     i_close = hmap["close"]
-    i_vol = hmap["volume"]  # PRICES 的 Volume 欄：張數（lots）
+    i_vol = hmap["volume"]
 
-    # ✅ 抓一次 PRICES 全表，建立 index（避免重複 get_all_values）
     prices_vals = ws_prices.get_all_values()
     price_index = build_prices_index_from_vals(prices_vals, hmap)
 
     items = read_source_items(ws_source)
-    print(f"[DBG] SOURCE sheet={SHEET_SOURCE} items={len(items)}")
-    print(f"[DBG] PRICES sheet={SHEET_PRICES} existing_rows={max(len(prices_vals)-1, 0)}")
+    print(f"[DBG] source_items={len(items)} first_20={[x[0] for x in items[:20]]}")
 
     updates = []
     appends = []
 
-    # 台灣日期時間（UTC+8）
     now_tpe = dt.datetime.utcnow() + dt.timedelta(hours=8)
     today_tpe = now_tpe.date()
 
     for sym, mkt in items:
         df = fetch_history_yf(sym, mkt)
         if df.empty:
-            print(f"[WARN] {sym}({mkt}) no data from Yahoo (.TW/.TWO tried)")
+            print(f"[WARN] {sym}({mkt}) no data from Yahoo")
             continue
 
-        # 只取近 90 交易日
         df = df.tail(90)
 
         last_dt = pd.to_datetime(df.index.max())
         last_date = last_dt.date()
         if last_date < today_tpe and now_tpe.hour >= 20:
-            print(f"[WARN] {sym} Yahoo 尚未更新到今天：last_date={last_date}, today={today_tpe}")
+            print(f"[WARN] {sym} Yahoo not updated today: last_date={last_date}, today={today_tpe}")
 
         sym_key = _norm_symbol(sym)
 
@@ -287,9 +271,9 @@ def main():
             d_str = pd.to_datetime(dtt).strftime("%Y-%m-%d")
             close = float(row["Close"])
 
-            # ✅ yfinance Volume=股數 → 轉張數
+            # ✅ yfinance Volume=股數 → 寫入 PRICES 的 Volume=張數
             vol_shares = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
-            vol_lots = int(round(vol_shares / 1000.0))  # ✅ 張數口徑
+            vol_lots = int(round(vol_shares / 1000.0))
 
             key = (d_str, sym_key)
 
@@ -319,5 +303,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
