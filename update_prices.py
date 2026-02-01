@@ -9,8 +9,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ✅ 不再用 WS_WATCHLIST（避免 workflow 把它覆蓋成 WATCHLIST）
-SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "SECTOR_MAP_MASTER_ALL_PLUS").strip()
+# ✅ 來源表：先吃 WS_SOURCE_SHEET；沒有才吃 WS_WATCHLIST（雙保險）
+SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "").strip() or os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS").strip()
 SHEET_PRICES = os.getenv("WS_PRICES", "PRICES").strip()
 
 LOOKBACK_CAL_DAYS = int(os.getenv("LOOKBACK_CAL_DAYS", "120"))
@@ -69,28 +69,35 @@ def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
     m = _norm(market)
     prefer = [f"{symbol}.TWO", f"{symbol}.TW"] if m == "otc" else [f"{symbol}.TW", f"{symbol}.TWO"]
 
+    last_err = None
     for ticker in prefer:
-        df = yf.download(
-            ticker,
-            start=start.strftime("%Y-%m-%d"),
-            end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
-            interval="1d",
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            group_by="column",
-        )
-        df = _normalize_cols(df)
-        if df is None or df.empty:
-            continue
-        if not {"Close", "Volume"}.issubset(set(df.columns)):
+        try:
+            df = yf.download(
+                ticker,
+                start=start.strftime("%Y-%m-%d"),
+                end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                group_by="column",
+            )
+            df = _normalize_cols(df)
+            if df is None or df.empty:
+                continue
+            if not {"Close", "Volume"}.issubset(set(df.columns)):
+                continue
+
+            df = df[["Close", "Volume"]].copy()
+            df = df.dropna(subset=["Close"])
+            if not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
             continue
 
-        df = df[["Close", "Volume"]].copy()
-        df = df.dropna(subset=["Close"])
-        if not df.empty:
-            return df
-
+    if last_err:
+        print(f"[WARN] {symbol} yfinance error: {last_err}")
     return pd.DataFrame()
 
 
@@ -128,7 +135,6 @@ def build_prices_index_from_vals(vals: List[List[str]], hmap: Dict[str, int]) ->
     return index
 
 
-# ======= 來源表讀 Symbol（SECTOR_MAP_MASTER_ALL_PLUS） =======
 def _find_header_row(vals: List[List[str]], max_scan: int = 60) -> int:
     keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
     scan = vals[: min(max_scan, len(vals))]
@@ -169,7 +175,17 @@ def _normalize_market(mkt: str) -> str:
     m = _norm(mkt)
     if m in ("otc", "tpex", "two") or "上櫃" in m:
         return "otc"
+    if m in ("tse", "twse", "tw", "上市") or "上市" in m:
+        return "tse"
     return "tse"
+
+
+def _open_ws_by_title_strip(sh, title: str):
+    target = (title or "").strip()
+    for ws in sh.worksheets():
+        if ws.title.strip() == target:
+            return ws
+    raise gspread.exceptions.WorksheetNotFound(f"Worksheet not found: {title}")
 
 
 def read_source_items(ws_source) -> List[Tuple[str, str]]:
@@ -178,14 +194,14 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
         raise RuntimeError(f"{ws_source.title} 沒有資料")
 
     hrow = _find_header_row(vals, max_scan=60)
-    header = vals[hrow]
+    header_raw = vals[hrow]
     rows = vals[hrow + 1:]
 
-    idx_symbol = _col_index(header, "symbol")
+    idx_symbol = _col_index(header_raw, "symbol")
     if idx_symbol < 0:
         raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 60 列）")
 
-    idx_market = _col_index(header, "market")  # 可沒有
+    idx_market = _col_index(header_raw, "market")  # 可沒有
 
     out: List[Tuple[str, str]] = []
     for r in rows:
@@ -201,7 +217,7 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
         mkt = _normalize_market(mkt)
         out.append((sym, mkt))
 
-    # ✅ Symbol 去重（同股多族群只抓一次）
+    # Symbol 去重（同股多族群只抓一次）
     seen = set()
     uniq = []
     for sym, mkt in out:
@@ -212,25 +228,15 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
     return uniq
 
 
-def _open_ws_by_title_strip(sh, title: str):
-    target = (title or "").strip()
-    for ws in sh.worksheets():
-        if ws.title.strip() == target:
-            return ws
-    raise gspread.exceptions.WorksheetNotFound(f"Worksheet not found: {title}")
-
-
 def main():
     sheet_url = os.environ["SHEET_URL"]
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    # ✅ 先列出所有工作表（讓你直接看是不是名字有空白/不同）
-    all_titles = [ws.title for ws in sh.worksheets()]
-    print("[DBG] worksheets:", all_titles)
+    titles = [ws.title for ws in sh.worksheets()]
+    print("[DBG] worksheets:", titles)
     print("[DBG] SHEET_SOURCE=", SHEET_SOURCE, "SHEET_PRICES=", SHEET_PRICES)
 
-    # ✅ 用 strip 匹配工作表名稱（避免尾巴空白）
     ws_source = _open_ws_by_title_strip(sh, SHEET_SOURCE)
     ws_prices = _open_ws_by_title_strip(sh, SHEET_PRICES)
 
@@ -252,12 +258,17 @@ def main():
     now_tpe = dt.datetime.utcnow() + dt.timedelta(hours=8)
     today_tpe = now_tpe.date()
 
+    ok_cnt = 0
+    empty_cnt = 0
+
     for sym, mkt in items:
         df = fetch_history_yf(sym, mkt)
         if df.empty:
-            print(f"[WARN] {sym}({mkt}) no data from Yahoo")
+            empty_cnt += 1
+            print(f"[WARN] {sym}({mkt}) no data from Yahoo (.TW/.TWO tried)")
             continue
 
+        ok_cnt += 1
         df = df.tail(90)
 
         last_dt = pd.to_datetime(df.index.max())
@@ -271,12 +282,11 @@ def main():
             d_str = pd.to_datetime(dtt).strftime("%Y-%m-%d")
             close = float(row["Close"])
 
-            # ✅ yfinance Volume=股數 → 寫入 PRICES 的 Volume=張數
+            # ✅ yfinance Volume=股數 → PRICES Volume=張數
             vol_shares = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
             vol_lots = int(round(vol_shares / 1000.0))
 
             key = (d_str, sym_key)
-
             if key in price_index:
                 row_no = price_index[key]
                 a1_close = gspread.utils.rowcol_to_a1(row_no, i_close + 1)
@@ -291,9 +301,10 @@ def main():
                 new_row[i_vol] = vol_lots
                 appends.append(new_row)
 
+    print(f"[DBG] yfinance_ok={ok_cnt} yfinance_empty={empty_cnt}")
+
     if updates:
         ws_prices.batch_update(updates, value_input_option="USER_ENTERED")
-
     if appends:
         appends.sort(key=lambda r: (_norm_date_str(r[i_date]), _norm_symbol(r[i_sym])))
         ws_prices.append_rows(appends, value_input_option="USER_ENTERED")
