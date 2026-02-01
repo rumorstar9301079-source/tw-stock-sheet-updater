@@ -9,7 +9,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-SHEET_WATCHLIST = os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS")
+# ✅ 改：清單來源改成 SECTOR_MAP_MASTER_ALL_PLUS
+SHEET_SOURCE = os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS")
 SHEET_REVENUE = os.getenv("WS_REVENUE", "REVENUE")
 
 REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
@@ -33,6 +34,18 @@ def get_client():
 
 def _norm(s: str) -> str:
     return (s or "").replace("\u00a0", " ").strip().lower()
+
+
+def _norm_symbol(sym: str) -> str:
+    """
+    SectorMap 常見：3023.0、前後空白、或帶 .TW/.TWO
+    這裡統一成純數字字串（或原字串）
+    """
+    s = str(sym or "").strip().upper()
+    s = s.replace(".TW", "").replace(".TWO", "").replace(".TPE", "")
+    if s.endswith(".0") and s.replace(".", "", 1).isdigit():
+        s = s[:-2]
+    return s
 
 
 def _find_header_row(vals: List[List[str]], max_scan: int = 40) -> int:
@@ -66,10 +79,13 @@ def _col_index(header: List[str], key: str) -> int:
     return -1
 
 
-def read_watchlist_symbols(ws_watch) -> List[str]:
-    vals = ws_watch.get_all_values()
+def read_source_symbols(ws_source) -> List[str]:
+    """
+    ✅ 從 SECTOR_MAP_MASTER_ALL_PLUS 讀 Symbol 清單（去重保序）
+    """
+    vals = ws_source.get_all_values()
     if len(vals) < 2:
-        raise RuntimeError("WATCHLIST 沒有資料")
+        raise RuntimeError(f"{SHEET_SOURCE} 沒有資料")
 
     hrow = _find_header_row(vals, max_scan=40)
     header = vals[hrow]
@@ -77,17 +93,15 @@ def read_watchlist_symbols(ws_watch) -> List[str]:
 
     idx_symbol = _col_index(header, "symbol")
     if idx_symbol < 0:
-        raise RuntimeError("WATCHLIST 找不到 Symbol/股票代碼/代號 欄位（表頭可能不在前 40 列）")
+        raise RuntimeError(f"{SHEET_SOURCE} 找不到 Symbol/股票代碼/代號 欄位（表頭可能不在前 40 列）")
 
-    out = []
+    out: List[str] = []
     for r in rows:
         if len(r) <= idx_symbol:
             continue
-        sym = str(r[idx_symbol]).strip()
+        sym = _norm_symbol(r[idx_symbol])
         if not sym:
             continue
-        if sym.endswith(".0") and sym.replace(".", "", 1).isdigit():
-            sym = sym[:-2]
         out.append(sym)
 
     # unique keep order
@@ -201,11 +215,12 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    ws_watch = sh.worksheet(SHEET_WATCHLIST)
+    ws_source = sh.worksheet(SHEET_SOURCE)
     ws_rev = sh.worksheet(SHEET_REVENUE)
 
-    symbols = read_watchlist_symbols(ws_watch)
-    print("[DBG] WATCHLIST symbols:", symbols)
+    symbols = read_source_symbols(ws_source)
+    print(f"[DBG] SOURCE sheet={SHEET_SOURCE} symbols_count={len(symbols)}")
+    print("[DBG] first_20:", symbols[:20])
 
     today = dt.date.today()
     start_date = (today.replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
@@ -240,7 +255,7 @@ def main():
     # 全表排序：先 Month 再 Symbol
     all_rows.sort(key=lambda x: (x[0], x[1]))
 
-    # ✅ 重建 REVENUE：清掉舊錯月份列（例如 2026-01 其實是 2025-12）
+    # ✅ 重建 REVENUE
     ws_rev.clear()
     ws_rev.update("A1:E1", [REVENUE_HEADERS])
     if all_rows:
@@ -248,9 +263,6 @@ def main():
 
     print(f"[DONE] rebuilt rows={len(all_rows)} latest_ok={latest_ok}")
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
