@@ -121,12 +121,17 @@ def read_source_symbols(ws_source) -> List[str]:
 
 def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     """
-    Month 一律以「營收月份」口徑：
-    - 優先 revenue_year + revenue_month（若有且有效）
-    - 否則用 date（公告/資料日），並回推 1 個月當營收月
+    取 FinMind 月營收資料，並把 Month 統一成「營收月份」口徑：
+    - 優先用 revenue_year + revenue_month（若有且有效）
+    - 否則用 date（公告/資料日），回推 1 個月當營收月
+
+    ✅ 任何權限/付費/限流/伺服器錯誤：不 raise，直接回空 df（避免 workflow 掛掉）
     """
+    symbol = _norm_symbol(symbol)
+
     if not FINMIND_TOKEN:
-        raise RuntimeError("FINMIND_TOKEN 未設定（請放到 GitHub Secrets: FINMIND_TOKEN）")
+        print("[WARN] FINMIND_TOKEN is empty; skip revenue fetch")
+        return pd.DataFrame()
 
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
     params = {
@@ -134,15 +139,45 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
         "data_id": symbol,
         "start_date": start_date,
     }
-    resp = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
 
+    try:
+        resp = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
+    except Exception as e:
+        print(f"[WARN] FinMind request exception: {symbol} | {e}")
+        return pd.DataFrame()
+
+    # ✅ 常見非 200：不要炸 pipeline
     if resp.status_code in (401, 402, 403):
-    print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {resp.text[:120]}")
-    return pd.DataFrame()
+        # 401: token 無效/過期
+        # 402: Payment Required（方案/權限/資料集限制）
+        # 403: Forbidden（權限不足）
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {msg}")
+        return pd.DataFrame()
 
-resp.raise_for_status()
-js = resp.json()
+    if resp.status_code == 429:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind 429 rate limited: {symbol} | {msg}")
+        return pd.DataFrame()
 
+    if resp.status_code >= 500:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind {resp.status_code} server error: {symbol} | {msg}")
+        return pd.DataFrame()
+
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind HTTP error: {symbol} | {e} | {msg}")
+        return pd.DataFrame()
+
+    try:
+        js = resp.json()
+    except Exception as e:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind JSON parse failed: {symbol} | {e} | {msg}")
+        return pd.DataFrame()
 
     data = js.get("data", [])
     if not data:
@@ -152,6 +187,7 @@ js = resp.json()
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
+    # --- Month 生成：營收月份口徑 ---
     used_year_month = False
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
@@ -173,14 +209,17 @@ js = resp.json()
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
+        # 公告月 -> 營收月
         df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
+    # --- Revenue 整理 ---
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0).astype("int64")
-    df["Symbol"] = str(symbol)
+    df["Symbol"] = symbol
 
     df = df[["Month", "Symbol", "Revenue"]].drop_duplicates(subset=["Month", "Symbol"])
     df = df.sort_values(["Symbol", "Month"]).reset_index(drop=True)
     return df
+
 
 
 def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
