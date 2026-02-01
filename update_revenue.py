@@ -135,8 +135,14 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
         "start_date": start_date,
     }
     resp = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
-    resp.raise_for_status()
-    js = resp.json()
+
+    if resp.status_code in (401, 402, 403):
+    print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {resp.text[:120]}")
+    return pd.DataFrame()
+
+resp.raise_for_status()
+js = resp.json()
+
 
     data = js.get("data", [])
     if not data:
