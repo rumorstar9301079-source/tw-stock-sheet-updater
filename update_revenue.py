@@ -9,9 +9,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ✅ 改：清單來源改成 SECTOR_MAP_MASTER_ALL_PLUS
-SHEET_SOURCE = os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS")
-SHEET_REVENUE = os.getenv("WS_REVENUE", "REVENUE")
+# ✅ 來源表改成 WS_SOURCE_SHEET（避免被 WS_WATCHLIST 覆蓋回 WATCHLIST）
+SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "SECTOR_MAP_MASTER_ALL_PLUS").strip()
+SHEET_REVENUE = os.getenv("WS_REVENUE", "REVENUE").strip()
 
 REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
 
@@ -37,10 +37,6 @@ def _norm(s: str) -> str:
 
 
 def _norm_symbol(sym: str) -> str:
-    """
-    SectorMap 常見：3023.0、前後空白、或帶 .TW/.TWO
-    這裡統一成純數字字串（或原字串）
-    """
     s = str(sym or "").strip().upper()
     s = s.replace(".TW", "").replace(".TWO", "").replace(".TPE", "")
     if s.endswith(".0") and s.replace(".", "", 1).isdigit():
@@ -48,7 +44,15 @@ def _norm_symbol(sym: str) -> str:
     return s
 
 
-def _find_header_row(vals: List[List[str]], max_scan: int = 40) -> int:
+def _open_ws_by_title_strip(sh, title: str):
+    target = (title or "").strip()
+    for ws in sh.worksheets():
+        if ws.title.strip() == target:
+            return ws
+    raise gspread.exceptions.WorksheetNotFound(f"Worksheet not found: {title}")
+
+
+def _find_header_row(vals: List[List[str]], max_scan: int = 60) -> int:
     keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
     scan = vals[: min(max_scan, len(vals))]
     for i, row in enumerate(scan):
@@ -85,15 +89,15 @@ def read_source_symbols(ws_source) -> List[str]:
     """
     vals = ws_source.get_all_values()
     if len(vals) < 2:
-        raise RuntimeError(f"{SHEET_SOURCE} 沒有資料")
+        raise RuntimeError(f"{ws_source.title} 沒有資料")
 
-    hrow = _find_header_row(vals, max_scan=40)
+    hrow = _find_header_row(vals, max_scan=60)
     header = vals[hrow]
     rows = vals[hrow + 1:]
 
     idx_symbol = _col_index(header, "symbol")
     if idx_symbol < 0:
-        raise RuntimeError(f"{SHEET_SOURCE} 找不到 Symbol/股票代碼/代號 欄位（表頭可能不在前 40 列）")
+        raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 60 列）")
 
     out: List[str] = []
     for r in rows:
@@ -142,7 +146,6 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
-    # --- Month 生成 ---
     used_year_month = False
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
@@ -164,7 +167,6 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
-        # 公告月 -> 營收月
         df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0).astype("int64")
@@ -176,9 +178,6 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
 
 
 def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    df: Month(YYYY-MM), Symbol, Revenue（同一 Symbol）
-    """
     if df.empty:
         return df
 
@@ -215,17 +214,20 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    ws_source = sh.worksheet(SHEET_SOURCE)
-    ws_rev = sh.worksheet(SHEET_REVENUE)
+    # ✅ 印出所有工作表，避免表名有空白/不一致
+    all_titles = [ws.title for ws in sh.worksheets()]
+    print("[DBG] worksheets:", all_titles)
+    print("[DBG] SHEET_SOURCE=", SHEET_SOURCE, "SHEET_REVENUE=", SHEET_REVENUE)
+
+    ws_source = _open_ws_by_title_strip(sh, SHEET_SOURCE)
+    ws_rev = _open_ws_by_title_strip(sh, SHEET_REVENUE)
 
     symbols = read_source_symbols(ws_source)
-    print(f"[DBG] SOURCE sheet={SHEET_SOURCE} symbols_count={len(symbols)}")
-    print("[DBG] first_20:", symbols[:20])
+    print(f"[DBG] source_symbols={len(symbols)} first_20={symbols[:20]}")
 
     today = dt.date.today()
     start_date = (today.replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
 
-    # ✅ 可用營收月份：本月 - 1（避免未公告月份提前寫入）
     latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
 
     all_rows = []
@@ -236,26 +238,20 @@ def main():
             print(f"[WARN] {sym} no revenue data")
             continue
 
-        # 不寫入未公告月份
         df = df[df["Month"] <= latest_ok].copy()
         if df.empty:
             continue
 
         df = compute_yoy_fields(df)
-
-        # 只留近 KEEP_MONTHS
         df = df.sort_values("Month").tail(KEEP_MONTHS).reset_index(drop=True)
 
-        # 組成要寫入的 rows
         for _, r in df.iterrows():
             yoy = "" if r["YoY"] == "" else float(r["YoY"])
             yoy3m = "" if r["YoY3M"] == "" else float(r["YoY3M"])
             all_rows.append([str(r["Month"]), str(r["Symbol"]), int(r["Revenue"]), yoy, yoy3m])
 
-    # 全表排序：先 Month 再 Symbol
     all_rows.sort(key=lambda x: (x[0], x[1]))
 
-    # ✅ 重建 REVENUE
     ws_rev.clear()
     ws_rev.update("A1:E1", [REVENUE_HEADERS])
     if all_rows:
