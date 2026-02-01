@@ -5,7 +5,6 @@ on:
   schedule:
      - cron: "15 8 * * 1-5"   # UTC 08:15 = Asia/Taipei 16:15 (Mon-Fri)
 
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -26,7 +25,10 @@ jobs:
           TZ: Asia/Taipei
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          WS_WATCHLIST: WATCHLIST
+
+          # ✅ 改：用新的來源 key，避免 WS_WATCHLIST 覆蓋
+          WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
+
           WS_PRICES: PRICES
           LOOKBACK_CAL_DAYS: "120"
         run: python update_prices.py
@@ -37,8 +39,12 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          WS_WATCHLIST: WATCHLIST
+
+          # ✅ 改：用新的來源 key，避免 WS_WATCHLIST 覆蓋
+          WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
+
           WS_REVENUE: REVENUE
           REVENUE_FETCH_YEARS: "4"
           REVENUE_KEEP_MONTHS: "36"
         run: python update_revenue.py
+
