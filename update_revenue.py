@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-SHEET_WATCHLIST = os.getenv("WS_WATCHLIST", "WATCHLIST")
+SHEET_WATCHLIST = os.getenv("WS_WATCHLIST", "SECTOR_MAP_MASTER_ALL_PLUS")
 SHEET_REVENUE = os.getenv("WS_REVENUE", "REVENUE")
 
 REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
