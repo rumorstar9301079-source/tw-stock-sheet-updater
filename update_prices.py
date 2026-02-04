@@ -14,6 +14,7 @@ SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "").strip() or os.getenv("WS_WATCHLI
 SHEET_PRICES = os.getenv("WS_PRICES", "PRICES").strip()
 
 LOOKBACK_CAL_DAYS = int(os.getenv("LOOKBACK_CAL_DAYS", "120"))
+TAIL_DAYS = int(os.getenv("PRICES_TAIL_DAYS", "90"))  # 寫入 PRICES 的天數上限（避免爆量）
 REQUIRED_HEADERS = ["Date", "Symbol", "Close", "Volume"]
 
 
@@ -101,47 +102,71 @@ def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def get_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int]]:
+def get_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int], int]:
+    """
+    ✅ 自動找 PRICES 的表頭列（不一定在第 1 列）
+    return: (header, hmap, header_row_0based)
+    """
     vals = ws_prices.get_all_values()
     if not vals:
         raise RuntimeError("PRICES 沒有任何資料（至少要有表頭列）")
 
-    header = [h.strip() for h in vals[0]]
+    header_row = -1
+    header = []
+    for i in range(min(300, len(vals))):
+        row = [c.strip() for c in vals[i]]
+        hmap_tmp = {c.strip().lower(): j for j, c in enumerate(row) if c.strip()}
+        if all(h.lower() in hmap_tmp for h in REQUIRED_HEADERS):
+            header_row = i
+            header = row
+            break
+
+    if header_row < 0:
+        raise RuntimeError("PRICES 找不到含 Date/Symbol/Close/Volume 的表頭列（前 300 列都沒有）")
+
     hmap = {h.strip().lower(): i for i, h in enumerate(header) if h.strip()}
-
-    missing = [h for h in REQUIRED_HEADERS if h.lower() not in hmap]
-    if missing:
-        raise RuntimeError(f"PRICES 表頭缺少必要欄位：{missing}（你目前表頭：{header}）")
-
-    return header, hmap
+    return header, hmap, header_row
 
 
-def build_prices_index_from_vals(vals: List[List[str]], hmap: Dict[str, int]) -> Dict[Tuple[str, str], int]:
-    if len(vals) < 2:
+def build_prices_index_from_vals(vals_from_header: List[List[str]], hmap: Dict[str, int], header_row_0based: int) -> Dict[Tuple[str, str], int]:
+    """
+    vals_from_header: 從「表頭列」開始的 values（第 0 列為表頭）
+    回傳的 row_no 是 Google Sheet 的實際列號（1-based）
+    """
+    if len(vals_from_header) < 2:
         return {}
 
     i_date = hmap["date"]
     i_sym = hmap["symbol"]
 
     index: Dict[Tuple[str, str], int] = {}
-    for row_no, r in enumerate(vals[1:], start=2):
+    # vals_from_header[1:] 的第一筆資料，其實際列號 = header_row_0based + 2（因為 0based → 1based，再 +1 跳過表頭）
+    for i, r in enumerate(vals_from_header[1:], start=0):
+        real_row_no = header_row_0based + 2 + i  # ✅ 修正：對齊實際列號
         if len(r) <= max(i_date, i_sym):
             continue
         d = _norm_date_str(r[i_date])
         s = _norm_symbol(r[i_sym])
         if not d or not s:
             continue
-        index[(d, s)] = row_no
+        index[(d, s)] = real_row_no
     return index
 
 
-def _find_header_row(vals: List[List[str]], max_scan: int = 60) -> int:
+def _find_header_row(vals: List[List[str]], max_scan: int = 300) -> int:
     keys = ["symbol", "股票代碼", "股票代號", "代號", "證券代號", "ticker", "stockno"]
     scan = vals[: min(max_scan, len(vals))]
     for i, row in enumerate(scan):
         text = "|".join(_norm(x) for x in row)
         if any(_norm(k) in text for k in keys):
             return i
+
+    # fallback：全表掃一次（避免表頭很下面）
+    for i, row in enumerate(vals):
+        text = "|".join(_norm(x) for x in row)
+        if any(_norm(k) in text for k in keys):
+            return i
+
     return 0
 
 
@@ -193,13 +218,14 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
     if len(vals) < 2:
         raise RuntimeError(f"{ws_source.title} 沒有資料")
 
-    hrow = _find_header_row(vals, max_scan=60)
+    # ✅ 修正：max_scan 用 300（原本 60 會抓不到表頭）
+    hrow = _find_header_row(vals, max_scan=300)
     header_raw = vals[hrow]
     rows = vals[hrow + 1:]
 
     idx_symbol = _col_index(header_raw, "symbol")
     if idx_symbol < 0:
-        raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 60 列）")
+        raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 300 列）")
 
     idx_market = _col_index(header_raw, "market")  # 可沒有
 
@@ -236,21 +262,25 @@ def main():
     titles = [ws.title for ws in sh.worksheets()]
     print("[DBG] worksheets:", titles)
     print("[DBG] SHEET_SOURCE=", SHEET_SOURCE, "SHEET_PRICES=", SHEET_PRICES)
+    print("[DBG] LOOKBACK_CAL_DAYS=", LOOKBACK_CAL_DAYS, "TAIL_DAYS=", TAIL_DAYS)
 
     ws_source = _open_ws_by_title_strip(sh, SHEET_SOURCE)
     ws_prices = _open_ws_by_title_strip(sh, SHEET_PRICES)
 
-    header, hmap = get_prices_header(ws_prices)
+    header, hmap, prices_hrow = get_prices_header(ws_prices)
     i_date = hmap["date"]
     i_sym = hmap["symbol"]
     i_close = hmap["close"]
     i_vol = hmap["volume"]
 
-    prices_vals = ws_prices.get_all_values()
-    price_index = build_prices_index_from_vals(prices_vals, hmap)
+    prices_vals_all = ws_prices.get_all_values()
+    prices_vals_from_header = prices_vals_all[prices_hrow:]
+    price_index = build_prices_index_from_vals(prices_vals_from_header, hmap, prices_hrow)
 
     items = read_source_items(ws_source)
-    print(f"[DBG] source_items={len(items)} first_20={[x[0] for x in items[:20]]}")
+    src_syms = [s for s, _ in items]
+    print(f"[DBG] source_items={len(items)} first_20={src_syms[:20]}")
+    print(f"[DBG] last_20_symbols_in_source={src_syms[-20:]}")
 
     updates = []
     appends = []
@@ -260,16 +290,18 @@ def main():
 
     ok_cnt = 0
     empty_cnt = 0
+    empty_list = []
 
     for sym, mkt in items:
         df = fetch_history_yf(sym, mkt)
         if df.empty:
             empty_cnt += 1
+            empty_list.append(sym)
             print(f"[WARN] {sym}({mkt}) no data from Yahoo (.TW/.TWO tried)")
             continue
 
         ok_cnt += 1
-        df = df.tail(90)
+        df = df.tail(TAIL_DAYS)
 
         last_dt = pd.to_datetime(df.index.max())
         last_date = last_dt.date()
@@ -302,10 +334,14 @@ def main():
                 appends.append(new_row)
 
     print(f"[DBG] yfinance_ok={ok_cnt} yfinance_empty={empty_cnt}")
+    if empty_list:
+        print(f"[DBG] yfinance_empty_list_first_30={empty_list[:30]}")
 
     if updates:
         ws_prices.batch_update(updates, value_input_option="USER_ENTERED")
+
     if appends:
+        # ✅ 先排序，維持 PRICES 可讀性
         appends.sort(key=lambda r: (_norm_date_str(r[i_date]), _norm_symbol(r[i_sym])))
         ws_prices.append_rows(appends, value_input_option="USER_ENTERED")
 
@@ -314,3 +350,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
