@@ -30,18 +30,17 @@ jobs:
           LOOKBACK_CAL_DAYS: "120"
         run: python update_prices.py
 
-      # ✅ NEW: 更新 TWII/TPEX 分頁（檔案在 repo 根目錄）
       - name: Update TWII/TPEX sheet
-        env:
-          TZ: Asia/Taipei
-          SHEET_URL: ${{ secrets.SHEET_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          REGIME_LOOKBACK_DAYS: "120"
-          TWII_TPEX_SHEET: "TWII/TPEX"
-          # 可選：你想覆寫來源也可以
-          # TAIEX_CSV_URL: "https://stooq.com/q/d/l/?s=twii&i=d"
-          # OTC_CSV_URL: "https://stooq.com/q/d/l/?s=tpex&i=d"
-        run: python update_twii_tpex.py
+      env:
+         TZ: Asia/Taipei
+         SHEET_URL: ${{ secrets.SHEET_URL }}
+         GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+         FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+
+         REGIME_LOOKBACK_DAYS: "120"
+         TWII_TPEX_SHEET: "TWII/TPEX"
+         run: python update_twii_tpex.py
+
 
       - name: Run revenue updater
         env:
