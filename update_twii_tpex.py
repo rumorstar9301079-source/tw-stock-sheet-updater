@@ -34,23 +34,42 @@ def fetch_stooq_series(url: str, out_col: str) -> pd.DataFrame:
     stooq daily CSV: Date,Open,High,Low,Close,Volume
     returns: DATE (YYYY-MM-DD), <out_col> (float)
     """
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    txt = (r.text or "").strip()
+    s = requests.Session()
+    last_err = None
 
-    if not txt.startswith("Date,"):
-        raise RuntimeError(f"Unexpected (not CSV) from {url}: {txt[:200]}")
+    for attempt in range(1, 4):  # retry 3 times
+        try:
+            r = s.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            txt = (r.text or "").strip()
 
-    df = pd.read_csv(StringIO(txt))
-    if "Date" not in df.columns or "Close" not in df.columns:
-        raise RuntimeError(f"Missing Date/Close in stooq CSV: {url}")
+            if not txt.startswith("Date,"):
+                raise RuntimeError(f"stooq not CSV (maybe blocked/html). head={txt[:200]}")
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-    df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
-    df["DATE"] = df["Date"].dt.strftime("%Y-%m-%d")
-    df[out_col] = df["Close"].astype(float)
-    return df[["DATE", out_col]]
+            df = pd.read_csv(StringIO(txt))
+
+            # robust check
+            cols = set(df.columns.astype(str))
+            if "Date" not in cols or "Close" not in cols:
+                raise RuntimeError(f"Missing Date/Close columns. cols={list(df.columns)[:20]}")
+
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
+
+            df["DATE"] = df["Date"].dt.strftime("%Y-%m-%d")
+            df[out_col] = df["Close"].astype(float)
+
+            out = df[["DATE", out_col]].dropna()
+            if out.empty:
+                raise RuntimeError("Parsed CSV but got empty output after cleaning.")
+
+            return out
+
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Failed to fetch {out_col} from stooq after retries. url={url} err={last_err}")
 
 
 def ensure_worksheet(ss, title: str):
