@@ -1,6 +1,7 @@
 import os
 import json
-from io import StringIO
+import datetime as dt
+from typing import Optional, Dict, Any
 
 import pandas as pd
 import requests
@@ -15,8 +16,12 @@ SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 TAB_NAME = os.getenv("TWII_TPEX_SHEET", "TWII/TPEX")
 LOOKBACK = int(os.getenv("REGIME_LOOKBACK_DAYS", "120"))
 
-TAIEX_CSV_URL = os.getenv("TAIEX_CSV_URL", "https://stooq.com/q/d/l/?s=twii&i=d")
-OTC_CSV_URL = os.getenv("OTC_CSV_URL", "https://stooq.com/q/d/l/?s=tpex&i=d")
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
+FINMIND_URL = os.getenv("FINMIND_URL", "https://api.finmindtrade.com/api/v4/data").strip()
+
+# FinMind 指數（報酬指數）代碼（FinMind 文件用這兩個）
+TAIEX_ID = os.getenv("FINMIND_TAIEX_ID", "TAIEX").strip()
+TPEX_ID = os.getenv("FINMIND_TPEX_ID", "TPEx").strip()
 
 
 def get_client():
@@ -29,65 +34,80 @@ def get_client():
     return gspread.authorize(creds)
 
 
-def fetch_stooq_series(url: str, out_col: str) -> pd.DataFrame:
-    """
-    stooq daily CSV: Date,Open,High,Low,Close,Volume
-    returns: DATE (YYYY-MM-DD), <out_col> (float)
-    """
-    s = requests.Session()
-    last_err = None
-
-    for attempt in range(1, 4):  # retry 3 times
-        try:
-            r = s.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            txt = (r.text or "").strip()
-
-            if not txt.startswith("Date,"):
-                raise RuntimeError(f"stooq not CSV (maybe blocked/html). head={txt[:200]}")
-
-            df = pd.read_csv(StringIO(txt))
-
-            # robust check
-            cols = set(df.columns.astype(str))
-            if "Date" not in cols or "Close" not in cols:
-                raise RuntimeError(f"Missing Date/Close columns. cols={list(df.columns)[:20]}")
-
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-            df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
-
-            df["DATE"] = df["Date"].dt.strftime("%Y-%m-%d")
-            df[out_col] = df["Close"].astype(float)
-
-            out = df[["DATE", out_col]].dropna()
-            if out.empty:
-                raise RuntimeError("Parsed CSV but got empty output after cleaning.")
-
-            return out
-
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"Failed to fetch {out_col} from stooq after retries. url={url} err={last_err}")
-
-
 def ensure_worksheet(ss, title: str):
     try:
         return ss.worksheet(title)
     except gspread.WorksheetNotFound:
-        return ss.add_worksheet(title=title, rows=1000, cols=10)
+        return ss.add_worksheet(title=title, rows=2000, cols=10)
+
+
+def finmind_get(dataset: str, data_id: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    FinMind v4:
+      GET /api/v4/data?dataset=...&data_id=...&start_date=...&end_date=...
+      header Authorization: Bearer <token>
+    """
+    if not FINMIND_TOKEN:
+        raise RuntimeError("Missing FINMIND_TOKEN env. Please set secrets.FINMIND_TOKEN and pass to this step.")
+
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
+    params = {
+        "dataset": dataset,
+        "data_id": data_id,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    j: Dict[str, Any] = r.json()
+
+    # FinMind 通常有 status / msg / data
+    data = j.get("data", [])
+    if not data:
+        raise RuntimeError(f"FinMind empty data: dataset={dataset} data_id={data_id} msg={j.get('msg')}")
+
+    df = pd.DataFrame(data)
+    return df
+
+
+def fetch_index_series(data_id: str, out_col: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    dataset: TaiwanStockTotalReturnIndex
+    columns (doc): price, stock_id, date
+    """
+    df = finmind_get("TaiwanStockTotalReturnIndex", data_id, start_date, end_date)
+
+    # normalize
+    if "date" not in df.columns or "price" not in df.columns:
+        raise RuntimeError(f"Unexpected schema from FinMind for {data_id}: cols={list(df.columns)[:30]}")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["date", "price"]).sort_values("date")
+
+    out = pd.DataFrame({
+        "DATE": df["date"].dt.strftime("%Y-%m-%d"),
+        out_col: df["price"].astype(float),
+    })
+    return out
 
 
 def write_df(ws, df: pd.DataFrame):
+    # 你這頁是專用指數表：直接清空重寫最乾淨
     ws.clear()
     values = [df.columns.tolist()] + df.values.tolist()
     ws.update(values, value_input_option="RAW")
 
 
 def main():
-    twii = fetch_stooq_series(TAIEX_CSV_URL, "TWII")
-    tpex = fetch_stooq_series(OTC_CSV_URL, "TPEX")
+    # 抓 LOOKBACK 的交易日：用較寬的日曆區間避免遇到假日
+    end = dt.date.today()
+    start = end - dt.timedelta(days=max(LOOKBACK * 2, 260))  # 120日回看，用2倍日曆緩衝
+    start_date = start.strftime("%Y-%m-%d")
+    end_date = end.strftime("%Y-%m-%d")
+
+    twii = fetch_index_series(TAIEX_ID, "TWII", start_date, end_date)
+    tpex = fetch_index_series(TPEX_ID, "TPEX", start_date, end_date)
 
     merged = pd.merge(twii, tpex, on="DATE", how="inner").sort_values("DATE")
     merged = merged.tail(LOOKBACK).reset_index(drop=True)
