@@ -43,7 +43,7 @@ jobs:
           # 可選：如要改來源可覆寫
           # TAIEX_CSV_URL: "https://stooq.com/q/d/l/?s=twii&i=d"
           # OTC_CSV_URL: "https://stooq.com/q/d/l/?s=tpex&i=d"
-        run: python scripts/update_twii_tpex.py
+        run: python update_twii_tpex.py
 
       - name: Run revenue updater
         env:
