@@ -26,12 +26,24 @@ jobs:
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # ✅ 改：用新的來源 key，避免 WS_WATCHLIST 覆蓋
           WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
-
           WS_PRICES: PRICES
           LOOKBACK_CAL_DAYS: "120"
         run: python update_prices.py
+
+      # ✅ NEW: 更新 TWII/TPEX 分頁（120筆交易日）
+      - name: Update TWII/TPEX sheet
+        env:
+          TZ: Asia/Taipei
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+          REGIME_LOOKBACK_DAYS: "120"
+          TWII_TPEX_SHEET: "TWII/TPEX"
+          # 可選：如要改來源可覆寫
+          # TAIEX_CSV_URL: "https://stooq.com/q/d/l/?s=twii&i=d"
+          # OTC_CSV_URL: "https://stooq.com/q/d/l/?s=tpex&i=d"
+        run: python scripts/update_twii_tpex.py
 
       - name: Run revenue updater
         env:
@@ -40,9 +52,7 @@ jobs:
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # ✅ 改：用新的來源 key，避免 WS_WATCHLIST 覆蓋
           WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
-
           WS_REVENUE: REVENUE
           REVENUE_FETCH_YEARS: "4"
           REVENUE_KEEP_MONTHS: "36"
