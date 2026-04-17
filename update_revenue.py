@@ -1,7 +1,7 @@
 import os
 import json
 import datetime as dt
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 
 import pandas as pd
 import requests
@@ -23,7 +23,7 @@ FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "6"))
 # ✅ 表上保留月數
 KEEP_MONTHS = int(os.getenv("REVENUE_KEEP_MONTHS", "36"))
 
-# ✅ 增量更新時，每檔只抓最近這些月就夠
+# ✅ 增量更新時，抓最近這些月即可
 INCREMENTAL_FETCH_MONTHS = int(os.getenv("REVENUE_INCREMENTAL_FETCH_MONTHS", "15"))
 
 
@@ -144,9 +144,10 @@ def read_existing_revenue(ws_rev) -> pd.DataFrame:
     return df[REVENUE_HEADERS].copy()
 
 
-def finmind_month_revenue(session: requests.Session, symbol: str, start_date: str) -> pd.DataFrame:
-    symbol = _norm_symbol(symbol)
-
+def finmind_month_revenue_all_market(session: requests.Session, start_date: str) -> pd.DataFrame:
+    """
+    ✅ 方案3：一次抓全市場 TaiwanStockMonthRevenue，再用 source symbols 過濾
+    """
     if not FINMIND_TOKEN:
         print("[WARN] FINMIND_TOKEN is empty; skip revenue fetch")
         return pd.DataFrame()
@@ -154,27 +155,26 @@ def finmind_month_revenue(session: requests.Session, symbol: str, start_date: st
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
     params = {
         "dataset": "TaiwanStockMonthRevenue",
-        "data_id": symbol,
         "start_date": start_date,
     }
 
     try:
-        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=30)
+        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=120)
     except Exception as e:
-        print(f"[WARN] FinMind request exception: {symbol} | {e}")
+        print(f"[WARN] FinMind all-market request exception: {e}")
         return pd.DataFrame()
 
     if resp.status_code in (401, 402, 403, 429) or resp.status_code >= 500:
-        msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {msg}")
+        msg = (resp.text or "")[:300].replace("\n", " ")
+        print(f"[WARN] FinMind HTTP {resp.status_code} all-market | {msg}")
         return pd.DataFrame()
 
     try:
         resp.raise_for_status()
         js = resp.json()
     except Exception as e:
-        msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind parse/http failed: {symbol} | {e} | {msg}")
+        msg = (resp.text or "")[:300].replace("\n", " ")
+        print(f"[WARN] FinMind parse/http failed all-market | {e} | {msg}")
         return pd.DataFrame()
 
     data = js.get("data", [])
@@ -185,6 +185,7 @@ def finmind_month_revenue(session: requests.Session, symbol: str, start_date: st
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
+    # --- Month 生成：營收月份口徑 ---
     used_year_month = False
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
@@ -206,14 +207,25 @@ def finmind_month_revenue(session: requests.Session, symbol: str, start_date: st
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
+        # 公告月 -> 營收月
         df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
+    # --- Symbol / Revenue 整理 ---
+    stock_col = None
+    for c in ["stock_id", "data_id", "symbol"]:
+        if c in df.columns:
+            stock_col = c
+            break
+    if stock_col is None:
+        return pd.DataFrame()
+
+    df["Symbol"] = df[stock_col].astype(str).map(_norm_symbol)
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
-    df["Symbol"] = symbol
 
     df = df[["Month", "Symbol", "Revenue"]].dropna(subset=["Revenue"])
+    df = df[df["Symbol"] != ""].copy()
     df["Revenue"] = df["Revenue"].astype("int64")
-    df = df.drop_duplicates(subset=["Month", "Symbol"])
+    df = df.drop_duplicates(subset=["Month", "Symbol"], keep="last")
     df = df.sort_values(["Symbol", "Month"]).reset_index(drop=True)
     return df
 
@@ -246,17 +258,17 @@ def month_n_months_ago(n: int) -> str:
 def ensure_header(ws_rev):
     vals = ws_rev.get_all_values()
     if not vals:
-        ws_rev.update("A1:E1", [REVENUE_HEADERS])
+        ws_rev.update(values=[REVENUE_HEADERS], range_name="A1:E1")
         return
     header = vals[0]
     if header[:5] != REVENUE_HEADERS:
         ws_rev.clear()
-        ws_rev.update("A1:E1", [REVENUE_HEADERS])
+        ws_rev.update(values=[REVENUE_HEADERS], range_name="A1:E1")
 
 
 def write_full_revenue(ws_rev, df_all: pd.DataFrame):
     ws_rev.clear()
-    ws_rev.update("A1:E1", [REVENUE_HEADERS])
+    ws_rev.update(values=[REVENUE_HEADERS], range_name="A1:E1")
 
     if df_all.empty:
         return
@@ -284,11 +296,11 @@ def main():
     ensure_header(ws_rev)
 
     symbols = read_source_symbols(ws_source)
+    symbol_set: Set[str] = set(symbols)
     existing = read_existing_revenue(ws_rev)
 
     latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
 
-    # ✅ 若表是空的，才全量建一次
     is_first_build = existing.empty
 
     if is_first_build:
@@ -296,27 +308,30 @@ def main():
         start_date = (dt.date.today().replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
     else:
         print("[MODE] incremental update")
-        # ✅ 只抓最近 15 個月，足夠重算 YoY / YoY3M
         start_date = (
             (pd.Timestamp.today().to_period("M") - INCREMENTAL_FETCH_MONTHS).to_timestamp().date().strftime("%Y-%m-%d")
         )
 
+    print(f"[DBG] source_symbols={len(symbols)} first_20={symbols[:20]}")
+    print(f"[DBG] start_date={start_date} latest_ok={latest_ok}")
+
     session = requests.Session()
-    new_parts = []
 
-    for sym in symbols:
-        df_new = finmind_month_revenue(session, sym, start_date=start_date)
-        if df_new.empty:
-            continue
-        df_new = df_new[df_new["Month"] <= latest_ok].copy()
-        if not df_new.empty:
-            new_parts.append(df_new)
-
-    if not new_parts and not is_first_build:
-        print("[DONE] no incremental rows")
+    # ✅ 一次抓全市場
+    fetched_all = finmind_month_revenue_all_market(session, start_date=start_date)
+    if fetched_all.empty and not is_first_build:
+        print("[DONE] no all-market revenue rows")
         return
 
-    fetched = pd.concat(new_parts, ignore_index=True) if new_parts else pd.DataFrame(columns=["Month", "Symbol", "Revenue"])
+    # ✅ 只保留你的股票池
+    fetched = fetched_all[fetched_all["Symbol"].isin(symbol_set)].copy() if not fetched_all.empty else pd.DataFrame(columns=["Month", "Symbol", "Revenue"])
+    fetched = fetched[fetched["Month"] <= latest_ok].copy()
+
+    print(f"[DBG] fetched_all_rows={len(fetched_all)} fetched_watchlist_rows={len(fetched)}")
+
+    if fetched.empty and not is_first_build:
+        print("[DONE] no filtered revenue rows")
+        return
 
     if is_first_build:
         df_all = fetched.copy()
