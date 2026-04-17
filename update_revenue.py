@@ -1,7 +1,8 @@
 import os
 import json
 import datetime as dt
-from typing import List, Dict, Tuple, Set
+import time
+from typing import List, Set
 
 import pandas as pd
 import requests
@@ -17,14 +18,14 @@ REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
-# ✅ 全量重建時才真的會用到這個
 FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "6"))
-
-# ✅ 表上保留月數
 KEEP_MONTHS = int(os.getenv("REVENUE_KEEP_MONTHS", "36"))
-
-# ✅ 增量更新時，抓最近這些月即可
 INCREMENTAL_FETCH_MONTHS = int(os.getenv("REVENUE_INCREMENTAL_FETCH_MONTHS", "15"))
+
+# ✅ 逐檔抓時的保護
+REQUEST_SLEEP_SEC = float(os.getenv("REVENUE_REQUEST_SLEEP_SEC", "0.15"))
+REQUEST_PAUSE_EVERY = int(os.getenv("REVENUE_REQUEST_PAUSE_EVERY", "20"))
+REQUEST_PAUSE_SEC = float(os.getenv("REVENUE_REQUEST_PAUSE_SEC", "1.2"))
 
 
 def get_client():
@@ -144,10 +145,35 @@ def read_existing_revenue(ws_rev) -> pd.DataFrame:
     return df[REVENUE_HEADERS].copy()
 
 
-def finmind_month_revenue_all_market(session: requests.Session, start_date: str) -> pd.DataFrame:
+def has_broken_revenue_rows(df: pd.DataFrame) -> bool:
     """
-    ✅ 方案3：一次抓全市場 TaiwanStockMonthRevenue，再用 source symbols 過濾
+    Revenue 空白，但 YoY / YoY3M 有值 => 舊資料壞掉
     """
+    if df.empty:
+        return False
+
+    bad = df[
+        df["Revenue"].isna() &
+        (
+            df["YoY"].notna() |
+            df["YoY3M"].notna()
+        )
+    ].copy()
+
+    if not bad.empty:
+        print(f"[WARN] broken revenue rows detected: {len(bad)}")
+        print("[WARN] sample broken rows:")
+        print(bad.head(10).to_dict("records"))
+        return True
+    return False
+
+
+def finmind_month_revenue(session: requests.Session, symbol: str, start_date: str) -> pd.DataFrame:
+    """
+    ✅ 改回逐檔抓，這個在你帳號/資料集組合下是有資料的
+    """
+    symbol = _norm_symbol(symbol)
+
     if not FINMIND_TOKEN:
         print("[WARN] FINMIND_TOKEN is empty; skip revenue fetch")
         return pd.DataFrame()
@@ -155,26 +181,33 @@ def finmind_month_revenue_all_market(session: requests.Session, start_date: str)
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
     params = {
         "dataset": "TaiwanStockMonthRevenue",
+        "data_id": symbol,
         "start_date": start_date,
     }
 
     try:
-        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=120)
+        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=30)
     except Exception as e:
-        print(f"[WARN] FinMind all-market request exception: {e}")
+        print(f"[WARN] FinMind request exception: {symbol} | {e}")
         return pd.DataFrame()
 
-    if resp.status_code in (401, 402, 403, 429) or resp.status_code >= 500:
-        msg = (resp.text or "")[:300].replace("\n", " ")
-        print(f"[WARN] FinMind HTTP {resp.status_code} all-market | {msg}")
+    if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {msg}")
+        return pd.DataFrame()
+
+    # ✅ 402 常見是額度/方案限制，這裡不 raise，直接空 df
+    if resp.status_code == 402:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind HTTP 402: {symbol} | {msg}")
         return pd.DataFrame()
 
     try:
         resp.raise_for_status()
         js = resp.json()
     except Exception as e:
-        msg = (resp.text or "")[:300].replace("\n", " ")
-        print(f"[WARN] FinMind parse/http failed all-market | {e} | {msg}")
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] FinMind parse/http failed: {symbol} | {e} | {msg}")
         return pd.DataFrame()
 
     data = js.get("data", [])
@@ -185,7 +218,6 @@ def finmind_month_revenue_all_market(session: requests.Session, start_date: str)
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
-    # --- Month 生成：營收月份口徑 ---
     used_year_month = False
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
@@ -207,20 +239,10 @@ def finmind_month_revenue_all_market(session: requests.Session, start_date: str)
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
-        # 公告月 -> 營收月
         df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
-    # --- Symbol / Revenue 整理 ---
-    stock_col = None
-    for c in ["stock_id", "data_id", "symbol"]:
-        if c in df.columns:
-            stock_col = c
-            break
-    if stock_col is None:
-        return pd.DataFrame()
-
-    df["Symbol"] = df[stock_col].astype(str).map(_norm_symbol)
     df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
+    df["Symbol"] = symbol
 
     df = df[["Month", "Symbol", "Revenue"]].dropna(subset=["Revenue"])
     df = df[df["Symbol"] != ""].copy()
@@ -260,6 +282,7 @@ def ensure_header(ws_rev):
     if not vals:
         ws_rev.update(values=[REVENUE_HEADERS], range_name="A1:E1")
         return
+
     header = vals[0]
     if header[:5] != REVENUE_HEADERS:
         ws_rev.clear()
@@ -267,11 +290,16 @@ def ensure_header(ws_rev):
 
 
 def write_full_revenue(ws_rev, df_all: pd.DataFrame):
+    """
+    ✅ 只有確定 df_all 有資料，才會 clear + rewrite
+    避免抓不到資料時把整張表清空
+    """
+    if df_all is None or df_all.empty:
+        print("[WARN] write_full_revenue skipped because df_all is empty")
+        return
+
     ws_rev.clear()
     ws_rev.update(values=[REVENUE_HEADERS], range_name="A1:E1")
-
-    if df_all.empty:
-        return
 
     rows = []
     for _, r in df_all.iterrows():
@@ -301,10 +329,14 @@ def main():
 
     latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
 
-    is_first_build = existing.empty
+    broken_existing = has_broken_revenue_rows(existing)
+    is_first_build = existing.empty or broken_existing
 
     if is_first_build:
-        print("[MODE] first build")
+        if broken_existing:
+            print("[MODE] force rebuild due to broken revenue rows")
+        else:
+            print("[MODE] first build")
         start_date = (dt.date.today().replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
     else:
         print("[MODE] incremental update")
@@ -316,21 +348,47 @@ def main():
     print(f"[DBG] start_date={start_date} latest_ok={latest_ok}")
 
     session = requests.Session()
+    new_parts = []
+    empty_symbols = []
 
-    # ✅ 一次抓全市場
-    fetched_all = finmind_month_revenue_all_market(session, start_date=start_date)
-    if fetched_all.empty and not is_first_build:
-        print("[DONE] no all-market revenue rows")
-        return
+    for i, sym in enumerate(symbols, start=1):
+        df_new = finmind_month_revenue(session, sym, start_date=start_date)
 
-    # ✅ 只保留你的股票池
-    fetched = fetched_all[fetched_all["Symbol"].isin(symbol_set)].copy() if not fetched_all.empty else pd.DataFrame(columns=["Month", "Symbol", "Revenue"])
+        if df_new.empty:
+            empty_symbols.append(sym)
+        else:
+            df_new = df_new[df_new["Month"] <= latest_ok].copy()
+            if not df_new.empty:
+                new_parts.append(df_new)
+
+        # ✅ 降低連續請求壓力
+        if REQUEST_SLEEP_SEC > 0:
+            time.sleep(REQUEST_SLEEP_SEC)
+
+        if REQUEST_PAUSE_EVERY > 0 and i % REQUEST_PAUSE_EVERY == 0:
+            print(f"[DBG] fetched {i}/{len(symbols)} symbols ...")
+            if REQUEST_PAUSE_SEC > 0:
+                time.sleep(REQUEST_PAUSE_SEC)
+
+    fetched = (
+        pd.concat(new_parts, ignore_index=True)
+        if new_parts else
+        pd.DataFrame(columns=["Month", "Symbol", "Revenue"])
+    )
+
+    fetched = fetched[fetched["Symbol"].isin(symbol_set)].copy()
     fetched = fetched[fetched["Month"] <= latest_ok].copy()
 
-    print(f"[DBG] fetched_all_rows={len(fetched_all)} fetched_watchlist_rows={len(fetched)}")
+    print(f"[DBG] fetched_watchlist_rows={len(fetched)} empty_symbols={len(empty_symbols)}")
+    if empty_symbols:
+        print(f"[DBG] empty_symbols_first_30={empty_symbols[:30]}")
 
-    if fetched.empty and not is_first_build:
-        print("[DONE] no filtered revenue rows")
+    # ✅ 關鍵保護：如果 first build 但完全抓不到，不覆蓋現有表
+    if fetched.empty:
+        if is_first_build:
+            print("[WARN] fetched is empty during first build; keep existing sheet unchanged")
+        else:
+            print("[DONE] no filtered revenue rows")
         return
 
     if is_first_build:
@@ -343,13 +401,21 @@ def main():
             g = g.tail(KEEP_MONTHS).copy()
             out_parts.append(g)
 
-        final_df = pd.concat(out_parts, ignore_index=True) if out_parts else pd.DataFrame(columns=REVENUE_HEADERS)
+        final_df = (
+            pd.concat(out_parts, ignore_index=True)
+            if out_parts else
+            pd.DataFrame(columns=REVENUE_HEADERS)
+        )
         final_df = final_df[REVENUE_HEADERS].sort_values(["Month", "Symbol"]).reset_index(drop=True)
+
+        if final_df.empty:
+            print("[WARN] final_df empty in rebuild; keep existing sheet unchanged")
+            return
+
         write_full_revenue(ws_rev, final_df)
-        print(f"[DONE] first build rows={len(final_df)} latest_ok={latest_ok}")
+        print(f"[DONE] rebuild rows={len(final_df)} latest_ok={latest_ok}")
         return
 
-    # ✅ 增量模式：只替換最近區間，不動舊資料
     cutoff_month = month_n_months_ago(INCREMENTAL_FETCH_MONTHS)
 
     old_keep = existing[existing["Month"] < cutoff_month].copy()
@@ -372,7 +438,11 @@ def main():
         g = g.tail(KEEP_MONTHS).copy()
         out_recent_parts.append(g)
 
-    recent_final = pd.concat(out_recent_parts, ignore_index=True) if out_recent_parts else pd.DataFrame(columns=REVENUE_HEADERS)
+    recent_final = (
+        pd.concat(out_recent_parts, ignore_index=True)
+        if out_recent_parts else
+        pd.DataFrame(columns=REVENUE_HEADERS)
+    )
 
     final_df = pd.concat(
         [
@@ -384,6 +454,10 @@ def main():
 
     final_df = final_df.drop_duplicates(subset=["Month", "Symbol"], keep="last")
     final_df = final_df.sort_values(["Month", "Symbol"]).reset_index(drop=True)
+
+    if final_df.empty:
+        print("[WARN] incremental final_df empty; keep existing sheet unchanged")
+        return
 
     write_full_revenue(ws_rev, final_df)
     print(f"[DONE] incremental rows={len(final_df)} latest_ok={latest_ok} cutoff={cutoff_month}")
