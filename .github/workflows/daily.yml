@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "15 8 * * 1-5"   # UTC 08:15 = Asia/Taipei 16:15 (Mon-Fri)
+    - cron: "10 13 * * 1-5"  # UTC 13:10 = Asia/Taipei 21:10 (Mon-Fri)
 
 jobs:
   run:
@@ -20,6 +21,16 @@ jobs:
       - name: Install deps
         run: pip install -q gspread google-auth pandas requests
 
+      - name: Update TWII/TPEX sheet
+        env:
+          TZ: Asia/Taipei
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          REGIME_LOOKBACK_DAYS: "120"
+          TWII_TPEX_SHEET: "TWII/TPEX"
+        run: python update_twii_tpex.py
+
       - name: Run price updater
         env:
           TZ: Asia/Taipei
@@ -30,17 +41,8 @@ jobs:
           WS_PRICES: PRICES
           LOOKBACK_CAL_DAYS: "120"
           PRICES_TAIL_DAYS: "90"
+          PRICES_INCREMENTAL_BUFFER_DAYS: "7"
         run: python update_prices.py
-
-      - name: Update TWII/TPEX sheet
-        env:
-          TZ: Asia/Taipei
-          SHEET_URL: ${{ secrets.SHEET_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          REGIME_LOOKBACK_DAYS: "120"
-          TWII_TPEX_SHEET: "TWII/TPEX"
-        run: python update_twii_tpex.py
 
       - name: Run revenue updater
         env:
@@ -53,4 +55,3 @@ jobs:
           REVENUE_FETCH_YEARS: "4"
           REVENUE_KEEP_MONTHS: "36"
         run: python update_revenue.py
-
