@@ -4,7 +4,7 @@ import datetime as dt
 from typing import Dict, Tuple, List
 
 import pandas as pd
-import yfinance as yf
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -17,6 +17,9 @@ LOOKBACK_CAL_DAYS = int(os.getenv("LOOKBACK_CAL_DAYS", "120"))
 TAIL_DAYS = int(os.getenv("PRICES_TAIL_DAYS", "90"))  # 寫入 PRICES 的天數上限（避免爆量）
 REQUIRED_HEADERS = ["Date", "Symbol", "Close", "Volume"]
 
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
 
 def get_client():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
@@ -26,14 +29,6 @@ def get_client():
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
-
-
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    return df
 
 
 def _norm(s: str) -> str:
@@ -61,45 +56,82 @@ def _norm_date_str(x: str) -> str:
         return s
 
 
-def fetch_history_yf(symbol: str, market: str) -> pd.DataFrame:
+def fetch_history_finmind(session: requests.Session, symbol: str) -> pd.DataFrame:
+    """
+    ✅ 改用 FinMind 抓台股日線
+    回傳欄位固定為：Close, Volume
+    index 為 DatetimeIndex
+    """
     symbol = _norm_symbol(symbol)
 
-    end = dt.datetime.utcnow()
+    if not FINMIND_TOKEN:
+        print("[WARN] FINMIND_TOKEN is empty")
+        return pd.DataFrame()
+
+    end = dt.date.today()
     start = end - dt.timedelta(days=LOOKBACK_CAL_DAYS)
 
-    m = _norm(market)
-    prefer = [f"{symbol}.TWO", f"{symbol}.TW"] if m == "otc" else [f"{symbol}.TW", f"{symbol}.TWO"]
+    headers = {
+        "Authorization": f"Bearer {FINMIND_TOKEN}"
+    }
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": symbol,
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+    }
 
-    last_err = None
-    for ticker in prefer:
-        try:
-            df = yf.download(
-                ticker,
-                start=start.strftime("%Y-%m-%d"),
-                end=(end + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
-                interval="1d",
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                group_by="column",
-            )
-            df = _normalize_cols(df)
-            if df is None or df.empty:
-                continue
-            if not {"Close", "Volume"}.issubset(set(df.columns)):
-                continue
+    try:
+        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=30)
+    except Exception as e:
+        print(f"[WARN] {symbol} FinMind request failed: {e}")
+        return pd.DataFrame()
 
-            df = df[["Close", "Volume"]].copy()
-            df = df.dropna(subset=["Close"])
-            if not df.empty:
-                return df
-        except Exception as e:
-            last_err = e
-            continue
+    if resp.status_code in (401, 402, 403, 429) or resp.status_code >= 500:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] {symbol} FinMind HTTP {resp.status_code}: {msg}")
+        return pd.DataFrame()
 
-    if last_err:
-        print(f"[WARN] {symbol} yfinance error: {last_err}")
-    return pd.DataFrame()
+    try:
+        resp.raise_for_status()
+        js = resp.json()
+    except Exception as e:
+        msg = (resp.text or "")[:200].replace("\n", " ")
+        print(f"[WARN] {symbol} FinMind parse/http failed: {e} | {msg}")
+        return pd.DataFrame()
+
+    data = js.get("data", [])
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame()
+
+    # FinMind 欄位：date, stock_id, open, max, min, close, Trading_Volume ...
+    if "date" not in df.columns or "close" not in df.columns:
+        print(f"[WARN] {symbol} FinMind missing required columns")
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["Close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    # ✅ 成交量優先用 Trading_Volume；沒有就退而求其次
+    if "Trading_Volume" in df.columns:
+        out["Volume"] = pd.to_numeric(df["Trading_Volume"], errors="coerce")
+    elif "trading_volume" in df.columns:
+        out["Volume"] = pd.to_numeric(df["trading_volume"], errors="coerce")
+    else:
+        out["Volume"] = 0
+
+    idx = pd.to_datetime(df["date"], errors="coerce")
+    out.index = idx
+
+    out = out.dropna(subset=["Close"])
+    out = out[~out.index.isna()]
+    out = out.sort_index()
+
+    return out
 
 
 def get_prices_header(ws_prices) -> Tuple[List[str], Dict[str, int], int]:
@@ -140,9 +172,8 @@ def build_prices_index_from_vals(vals_from_header: List[List[str]], hmap: Dict[s
     i_sym = hmap["symbol"]
 
     index: Dict[Tuple[str, str], int] = {}
-    # vals_from_header[1:] 的第一筆資料，其實際列號 = header_row_0based + 2（因為 0based → 1based，再 +1 跳過表頭）
     for i, r in enumerate(vals_from_header[1:], start=0):
-        real_row_no = header_row_0based + 2 + i  # ✅ 修正：對齊實際列號
+        real_row_no = header_row_0based + 2 + i
         if len(r) <= max(i_date, i_sym):
             continue
         d = _norm_date_str(r[i_date])
@@ -161,7 +192,6 @@ def _find_header_row(vals: List[List[str]], max_scan: int = 300) -> int:
         if any(_norm(k) in text for k in keys):
             return i
 
-    # fallback：全表掃一次（避免表頭很下面）
     for i, row in enumerate(vals):
         text = "|".join(_norm(x) for x in row)
         if any(_norm(k) in text for k in keys):
@@ -218,7 +248,6 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
     if len(vals) < 2:
         raise RuntimeError(f"{ws_source.title} 沒有資料")
 
-    # ✅ 修正：max_scan 用 300（原本 60 會抓不到表頭）
     hrow = _find_header_row(vals, max_scan=300)
     header_raw = vals[hrow]
     rows = vals[hrow + 1:]
@@ -227,7 +256,7 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
     if idx_symbol < 0:
         raise RuntimeError(f"{ws_source.title} 找不到 Symbol 欄（表頭可能不在前 300 列）")
 
-    idx_market = _col_index(header_raw, "market")  # 可沒有
+    idx_market = _col_index(header_raw, "market")
 
     out: List[Tuple[str, str]] = []
     for r in rows:
@@ -243,7 +272,6 @@ def read_source_items(ws_source) -> List[Tuple[str, str]]:
         mkt = _normalize_market(mkt)
         out.append((sym, mkt))
 
-    # Symbol 去重（同股多族群只抓一次）
     seen = set()
     uniq = []
     for sym, mkt in out:
@@ -292,12 +320,14 @@ def main():
     empty_cnt = 0
     empty_list = []
 
+    session = requests.Session()
+
     for sym, mkt in items:
-        df = fetch_history_yf(sym, mkt)
+        df = fetch_history_finmind(session, sym)
         if df.empty:
             empty_cnt += 1
             empty_list.append(sym)
-            print(f"[WARN] {sym}({mkt}) no data from Yahoo (.TW/.TWO tried)")
+            print(f"[WARN] {sym}({mkt}) no data from FinMind")
             continue
 
         ok_cnt += 1
@@ -306,7 +336,7 @@ def main():
         last_dt = pd.to_datetime(df.index.max())
         last_date = last_dt.date()
         if last_date < today_tpe and now_tpe.hour >= 20:
-            print(f"[WARN] {sym} Yahoo not updated today: last_date={last_date}, today={today_tpe}")
+            print(f"[WARN] {sym} FinMind not updated today: last_date={last_date}, today={today_tpe}")
 
         sym_key = _norm_symbol(sym)
 
@@ -314,7 +344,7 @@ def main():
             d_str = pd.to_datetime(dtt).strftime("%Y-%m-%d")
             close = float(row["Close"])
 
-            # ✅ yfinance Volume=股數 → PRICES Volume=張數
+            # ✅ FinMind Trading_Volume 通常是股數，這裡統一轉張數
             vol_shares = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
             vol_lots = int(round(vol_shares / 1000.0))
 
@@ -333,15 +363,14 @@ def main():
                 new_row[i_vol] = vol_lots
                 appends.append(new_row)
 
-    print(f"[DBG] yfinance_ok={ok_cnt} yfinance_empty={empty_cnt}")
+    print(f"[DBG] finmind_ok={ok_cnt} finmind_empty={empty_cnt}")
     if empty_list:
-        print(f"[DBG] yfinance_empty_list_first_30={empty_list[:30]}")
+        print(f"[DBG] finmind_empty_list_first_30={empty_list[:30]}")
 
     if updates:
         ws_prices.batch_update(updates, value_input_option="USER_ENTERED")
 
     if appends:
-        # ✅ 先排序，維持 PRICES 可讀性
         appends.sort(key=lambda r: (_norm_date_str(r[i_date]), _norm_symbol(r[i_sym])))
         ws_prices.append_rows(appends, value_input_option="USER_ENTERED")
 
@@ -350,4 +379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
