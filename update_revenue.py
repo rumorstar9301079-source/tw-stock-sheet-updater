@@ -1,7 +1,7 @@
 import os
 import json
 import datetime as dt
-from typing import List
+from typing import List, Dict, Tuple
 
 import pandas as pd
 import requests
@@ -9,7 +9,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ✅ 來源表改成 WS_SOURCE_SHEET（避免被 WS_WATCHLIST 覆蓋回 WATCHLIST）
 SHEET_SOURCE = os.getenv("WS_SOURCE_SHEET", "SECTOR_MAP_MASTER_ALL_PLUS").strip()
 SHEET_REVENUE = os.getenv("WS_REVENUE", "REVENUE").strip()
 
@@ -18,8 +17,14 @@ REVENUE_HEADERS = ["Month", "Symbol", "Revenue", "YoY", "YoY3M"]
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
+# ✅ 全量重建時才真的會用到這個
 FETCH_YEARS = int(os.getenv("REVENUE_FETCH_YEARS", "6"))
+
+# ✅ 表上保留月數
 KEEP_MONTHS = int(os.getenv("REVENUE_KEEP_MONTHS", "36"))
+
+# ✅ 增量更新時，每檔只抓最近這些月就夠
+INCREMENTAL_FETCH_MONTHS = int(os.getenv("REVENUE_INCREMENTAL_FETCH_MONTHS", "15"))
 
 
 def get_client():
@@ -84,9 +89,6 @@ def _col_index(header: List[str], key: str) -> int:
 
 
 def read_source_symbols(ws_source) -> List[str]:
-    """
-    ✅ 從 SECTOR_MAP_MASTER_ALL_PLUS 讀 Symbol 清單（去重保序）
-    """
     vals = ws_source.get_all_values()
     if len(vals) < 2:
         raise RuntimeError(f"{ws_source.title} 沒有資料")
@@ -104,29 +106,45 @@ def read_source_symbols(ws_source) -> List[str]:
         if len(r) <= idx_symbol:
             continue
         sym = _norm_symbol(r[idx_symbol])
-        if not sym:
-            continue
-        out.append(sym)
+        if sym:
+            out.append(sym)
 
-    # unique keep order
     seen = set()
     uniq = []
     for s in out:
-        if s in seen:
-            continue
-        seen.add(s)
-        uniq.append(s)
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
     return uniq
 
 
-def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
-    """
-    取 FinMind 月營收資料，並把 Month 統一成「營收月份」口徑：
-    - 優先用 revenue_year + revenue_month（若有且有效）
-    - 否則用 date（公告/資料日），回推 1 個月當營收月
+def read_existing_revenue(ws_rev) -> pd.DataFrame:
+    vals = ws_rev.get_all_values()
+    if not vals:
+        return pd.DataFrame(columns=REVENUE_HEADERS)
 
-    ✅ 任何權限/付費/限流/伺服器錯誤：不 raise，直接回空 df（避免 workflow 掛掉）
-    """
+    header = vals[0]
+    rows = vals[1:]
+    if not rows:
+        return pd.DataFrame(columns=REVENUE_HEADERS)
+
+    df = pd.DataFrame(rows, columns=header)
+    for col in REVENUE_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["Month"] = df["Month"].astype(str).str.strip()
+    df["Symbol"] = df["Symbol"].map(_norm_symbol)
+    df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce")
+    df["YoY"] = pd.to_numeric(df["YoY"], errors="coerce")
+    df["YoY3M"] = pd.to_numeric(df["YoY3M"], errors="coerce")
+
+    df = df[df["Month"] != ""].copy()
+    df = df[df["Symbol"] != ""].copy()
+    return df[REVENUE_HEADERS].copy()
+
+
+def finmind_month_revenue(session: requests.Session, symbol: str, start_date: str) -> pd.DataFrame:
     symbol = _norm_symbol(symbol)
 
     if not FINMIND_TOKEN:
@@ -141,42 +159,22 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     }
 
     try:
-        resp = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
+        resp = session.get(FINMIND_URL, headers=headers, params=params, timeout=30)
     except Exception as e:
         print(f"[WARN] FinMind request exception: {symbol} | {e}")
         return pd.DataFrame()
 
-    # ✅ 常見非 200：不要炸 pipeline
-    if resp.status_code in (401, 402, 403):
-        # 401: token 無效/過期
-        # 402: Payment Required（方案/權限/資料集限制）
-        # 403: Forbidden（權限不足）
+    if resp.status_code in (401, 402, 403, 429) or resp.status_code >= 500:
         msg = (resp.text or "")[:200].replace("\n", " ")
         print(f"[WARN] FinMind HTTP {resp.status_code}: {symbol} | {msg}")
         return pd.DataFrame()
 
-    if resp.status_code == 429:
-        msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind 429 rate limited: {symbol} | {msg}")
-        return pd.DataFrame()
-
-    if resp.status_code >= 500:
-        msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind {resp.status_code} server error: {symbol} | {msg}")
-        return pd.DataFrame()
-
     try:
         resp.raise_for_status()
-    except Exception as e:
-        msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind HTTP error: {symbol} | {e} | {msg}")
-        return pd.DataFrame()
-
-    try:
         js = resp.json()
     except Exception as e:
         msg = (resp.text or "")[:200].replace("\n", " ")
-        print(f"[WARN] FinMind JSON parse failed: {symbol} | {e} | {msg}")
+        print(f"[WARN] FinMind parse/http failed: {symbol} | {e} | {msg}")
         return pd.DataFrame()
 
     data = js.get("data", [])
@@ -187,7 +185,6 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
     if "revenue" not in df.columns:
         return pd.DataFrame()
 
-    # --- Month 生成：營收月份口徑 ---
     used_year_month = False
     if "revenue_year" in df.columns and "revenue_month" in df.columns:
         y = pd.to_numeric(df["revenue_year"], errors="coerce")
@@ -209,49 +206,71 @@ def finmind_month_revenue(symbol: str, start_date: str) -> pd.DataFrame:
         ok = d.notna()
         df = df[ok].copy()
         d = d[ok]
-        # 公告月 -> 營收月
         df["Month"] = (d.dt.to_period("M") - 1).astype(str)
 
-    # --- Revenue 整理 ---
-    df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0).astype("int64")
+    df["Revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
     df["Symbol"] = symbol
 
-    df = df[["Month", "Symbol", "Revenue"]].drop_duplicates(subset=["Month", "Symbol"])
+    df = df[["Month", "Symbol", "Revenue"]].dropna(subset=["Revenue"])
+    df["Revenue"] = df["Revenue"].astype("int64")
+    df = df.drop_duplicates(subset=["Month", "Symbol"])
     df = df.sort_values(["Symbol", "Month"]).reset_index(drop=True)
     return df
 
 
-
-def compute_yoy_fields(df: pd.DataFrame) -> pd.DataFrame:
+def compute_yoy_fields_fast(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.sort_values("Month").reset_index(drop=True)
-    df["Period"] = pd.PeriodIndex(df["Month"], freq="M")
-    rev_map = dict(zip(df["Period"], df["Revenue"]))
+    df = df.sort_values("Month").reset_index(drop=True).copy()
+    df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce")
 
-    yoy, yoy3m = [], []
-    for p, rev in zip(df["Period"], df["Revenue"]):
-        base = rev_map.get(p - 12, None)
-        if base is None or base == 0:
-            yoy.append("")
-        else:
-            yoy.append(float(rev) / float(base) - 1.0)
+    s = df["Revenue"]
+    base_12 = s.shift(12)
+    df["YoY"] = (s / base_12) - 1.0
 
-        cur3 = [rev_map.get(p - k, None) for k in (0, 1, 2)]
-        pre3 = [rev_map.get((p - 12) - k, None) for k in (0, 1, 2)]
-        if any(v is None for v in cur3) or any(v is None for v in pre3):
-            yoy3m.append("")
-        else:
-            s_cur, s_pre = sum(cur3), sum(pre3)
-            if s_pre == 0:
-                yoy3m.append("")
-            else:
-                yoy3m.append(float(s_cur) / float(s_pre) - 1.0)
+    cur3 = s + s.shift(1) + s.shift(2)
+    pre3 = s.shift(12) + s.shift(13) + s.shift(14)
+    df["YoY3M"] = (cur3 / pre3) - 1.0
 
-    df["YoY"] = yoy
-    df["YoY3M"] = yoy3m
-    return df.drop(columns=["Period"])
+    df.loc[base_12.isna() | (base_12 == 0), "YoY"] = pd.NA
+    df.loc[pre3.isna() | (pre3 == 0), "YoY3M"] = pd.NA
+
+    return df
+
+
+def month_n_months_ago(n: int) -> str:
+    return (pd.Timestamp.today().to_period("M") - n).strftime("%Y-%m")
+
+
+def ensure_header(ws_rev):
+    vals = ws_rev.get_all_values()
+    if not vals:
+        ws_rev.update("A1:E1", [REVENUE_HEADERS])
+        return
+    header = vals[0]
+    if header[:5] != REVENUE_HEADERS:
+        ws_rev.clear()
+        ws_rev.update("A1:E1", [REVENUE_HEADERS])
+
+
+def write_full_revenue(ws_rev, df_all: pd.DataFrame):
+    ws_rev.clear()
+    ws_rev.update("A1:E1", [REVENUE_HEADERS])
+
+    if df_all.empty:
+        return
+
+    rows = []
+    for _, r in df_all.iterrows():
+        rows.append([
+            str(r["Month"]),
+            str(r["Symbol"]),
+            int(r["Revenue"]) if pd.notna(r["Revenue"]) else "",
+            "" if pd.isna(r["YoY"]) else float(r["YoY"]),
+            "" if pd.isna(r["YoY3M"]) else float(r["YoY3M"]),
+        ])
+    ws_rev.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 def main():
@@ -259,52 +278,101 @@ def main():
     gc = get_client()
     sh = gc.open_by_url(sheet_url)
 
-    # ✅ 印出所有工作表，避免表名有空白/不一致
-    all_titles = [ws.title for ws in sh.worksheets()]
-    print("[DBG] worksheets:", all_titles)
-    print("[DBG] SHEET_SOURCE=", SHEET_SOURCE, "SHEET_REVENUE=", SHEET_REVENUE)
-
     ws_source = _open_ws_by_title_strip(sh, SHEET_SOURCE)
     ws_rev = _open_ws_by_title_strip(sh, SHEET_REVENUE)
 
-    symbols = read_source_symbols(ws_source)
-    print(f"[DBG] source_symbols={len(symbols)} first_20={symbols[:20]}")
+    ensure_header(ws_rev)
 
-    today = dt.date.today()
-    start_date = (today.replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
+    symbols = read_source_symbols(ws_source)
+    existing = read_existing_revenue(ws_rev)
 
     latest_ok = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
 
-    all_rows = []
+    # ✅ 若表是空的，才全量建一次
+    is_first_build = existing.empty
+
+    if is_first_build:
+        print("[MODE] first build")
+        start_date = (dt.date.today().replace(day=1) - dt.timedelta(days=365 * FETCH_YEARS)).strftime("%Y-%m-%d")
+    else:
+        print("[MODE] incremental update")
+        # ✅ 只抓最近 15 個月，足夠重算 YoY / YoY3M
+        start_date = (
+            (pd.Timestamp.today().to_period("M") - INCREMENTAL_FETCH_MONTHS).to_timestamp().date().strftime("%Y-%m-%d")
+        )
+
+    session = requests.Session()
+    new_parts = []
 
     for sym in symbols:
-        df = finmind_month_revenue(sym, start_date=start_date)
-        if df.empty:
-            print(f"[WARN] {sym} no revenue data")
+        df_new = finmind_month_revenue(session, sym, start_date=start_date)
+        if df_new.empty:
             continue
+        df_new = df_new[df_new["Month"] <= latest_ok].copy()
+        if not df_new.empty:
+            new_parts.append(df_new)
 
-        df = df[df["Month"] <= latest_ok].copy()
-        if df.empty:
-            continue
+    if not new_parts and not is_first_build:
+        print("[DONE] no incremental rows")
+        return
 
-        df = compute_yoy_fields(df)
-        df = df.sort_values("Month").tail(KEEP_MONTHS).reset_index(drop=True)
+    fetched = pd.concat(new_parts, ignore_index=True) if new_parts else pd.DataFrame(columns=["Month", "Symbol", "Revenue"])
 
-        for _, r in df.iterrows():
-            yoy = "" if r["YoY"] == "" else float(r["YoY"])
-            yoy3m = "" if r["YoY3M"] == "" else float(r["YoY3M"])
-            all_rows.append([str(r["Month"]), str(r["Symbol"]), int(r["Revenue"]), yoy, yoy3m])
+    if is_first_build:
+        df_all = fetched.copy()
+        df_all = df_all.sort_values(["Symbol", "Month"]).reset_index(drop=True)
 
-    all_rows.sort(key=lambda x: (x[0], x[1]))
+        out_parts = []
+        for sym, g in df_all.groupby("Symbol", sort=False):
+            g = compute_yoy_fields_fast(g)
+            g = g.tail(KEEP_MONTHS).copy()
+            out_parts.append(g)
 
-    ws_rev.clear()
-    ws_rev.update("A1:E1", [REVENUE_HEADERS])
-    if all_rows:
-        ws_rev.append_rows(all_rows, value_input_option="USER_ENTERED")
+        final_df = pd.concat(out_parts, ignore_index=True) if out_parts else pd.DataFrame(columns=REVENUE_HEADERS)
+        final_df = final_df[REVENUE_HEADERS].sort_values(["Month", "Symbol"]).reset_index(drop=True)
+        write_full_revenue(ws_rev, final_df)
+        print(f"[DONE] first build rows={len(final_df)} latest_ok={latest_ok}")
+        return
 
-    print(f"[DONE] rebuilt rows={len(all_rows)} latest_ok={latest_ok}")
+    # ✅ 增量模式：只替換最近區間，不動舊資料
+    cutoff_month = month_n_months_ago(INCREMENTAL_FETCH_MONTHS)
+
+    old_keep = existing[existing["Month"] < cutoff_month].copy()
+    old_recent = existing[existing["Month"] >= cutoff_month].copy()
+
+    merged_recent = pd.concat(
+        [
+            old_recent[["Month", "Symbol", "Revenue"]],
+            fetched[["Month", "Symbol", "Revenue"]],
+        ],
+        ignore_index=True,
+    )
+
+    merged_recent = merged_recent.drop_duplicates(subset=["Month", "Symbol"], keep="last")
+    merged_recent = merged_recent.sort_values(["Symbol", "Month"]).reset_index(drop=True)
+
+    out_recent_parts = []
+    for sym, g in merged_recent.groupby("Symbol", sort=False):
+        g = compute_yoy_fields_fast(g)
+        g = g.tail(KEEP_MONTHS).copy()
+        out_recent_parts.append(g)
+
+    recent_final = pd.concat(out_recent_parts, ignore_index=True) if out_recent_parts else pd.DataFrame(columns=REVENUE_HEADERS)
+
+    final_df = pd.concat(
+        [
+            old_keep[REVENUE_HEADERS],
+            recent_final[REVENUE_HEADERS],
+        ],
+        ignore_index=True,
+    )
+
+    final_df = final_df.drop_duplicates(subset=["Month", "Symbol"], keep="last")
+    final_df = final_df.sort_values(["Month", "Symbol"]).reset_index(drop=True)
+
+    write_full_revenue(ws_rev, final_df)
+    print(f"[DONE] incremental rows={len(final_df)} latest_ok={latest_ok} cutoff={cutoff_month}")
 
 
 if __name__ == "__main__":
     main()
-
