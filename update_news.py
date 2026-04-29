@@ -3,7 +3,6 @@ import re
 import time
 import json
 import feedparser
-import pandas as pd
 import gspread
 from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
@@ -36,28 +35,43 @@ def get_ws(ss, title):
     try:
         return ss.worksheet(title)
     except gspread.WorksheetNotFound:
-        return ss.add_worksheet(title=title, rows=1000, cols=len(HEADERS))
+        return ss.add_worksheet(title=title, rows=2000, cols=len(HEADERS))
+
+
+def find_header_row(values):
+    for i, row in enumerate(values[:50]):
+        normalized = [str(x).strip() for x in row]
+        if "Symbol" in normalized and "Name" in normalized:
+            return i, normalized
+    raise Exception("找不到 Symbol / Name 表頭")
+
+
+def col_idx(header, candidates):
+    for c in candidates:
+        if c in header:
+            return header.index(c)
+    return -1
 
 
 def read_source_symbols(ss):
     ws = ss.worksheet(WS_SOURCE_SHEET)
     values = ws.get_all_values()
-    header = values[0]
 
-    def idx(name):
-        return header.index(name) if name in header else -1
+    header_row, header = find_header_row(values)
 
-    i_symbol = idx("Symbol")
-    i_name = idx("Name")
-    i_sector = idx("Sector")
-    i_sub = idx("SubSector")
+    i_symbol = col_idx(header, ["Symbol", "股票代號", "代號"])
+    i_name = col_idx(header, ["Name", "股票名稱", "名稱"])
+    i_sector = col_idx(header, ["Sector", "族群"])
+    i_sub = col_idx(header, ["SubSector", "子族群"])
 
     rows = []
-    for r in values[1:]:
+
+    for r in values[header_row + 1:]:
         if i_symbol < 0 or i_symbol >= len(r):
             continue
 
         symbol = str(r[i_symbol]).strip()
+
         if not re.match(r"^\d{4}$", symbol):
             continue
 
@@ -70,28 +84,52 @@ def read_source_symbols(ss):
 
     seen = set()
     out = []
+
     for x in rows:
         if x["Symbol"] not in seen:
             out.append(x)
             seen.add(x["Symbol"])
+
     return out
 
 
 def fetch_google_news(symbol, name):
     query = f"{symbol} {name} 股票"
-    url = "https://news.google.com/rss/search?q=" + query + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    url = (
+        "https://news.google.com/rss/search?q="
+        + query
+        + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    )
 
     feed = feedparser.parse(url)
-    items = []
 
-    for e in feed.entries[:5]:
-        title = e.get("title", "")
-        link = e.get("link", "")
+    items = []
+    now = datetime.now(timezone.utc)
+
+    for e in feed.entries:
+        pub_time = None
+
+        if "published_parsed" in e and e.published_parsed:
+            pub_time = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+
+        if not pub_time:
+            continue
+
+        if (now - pub_time).days > NEWS_LOOKBACK_DAYS:
+            continue
+
+        title = e.get("title", "").strip()
+        link = e.get("link", "").strip()
+
+        if not title or not link:
+            continue
+
         source = ""
         if "source" in e:
             source = e.source.get("title", "")
 
         pub = e.get("published", "")
+
         items.append({
             "Title": title,
             "Source": source,
@@ -107,13 +145,19 @@ def calc_score(title):
     score = 0
 
     key_list = [
-        "AI", "伺服器", "CPO", "光通訊", "記憶體", "DRAM", "NAND",
-        "漲價", "轉強", "營收", "創高", "接單", "擴產",
-        "台積電", "輝達", "NVIDIA", "ASIC", "BBU", "電力"
+        "AI", "伺服器", "CPO", "光通訊", "矽光子",
+        "記憶體", "DRAM", "NAND", "HBM",
+        "漲價", "報價", "轉強", "營收", "創高",
+        "接單", "擴產", "法說", "展望",
+        "台積電", "輝達", "NVIDIA", "ASIC",
+        "BBU", "電力", "散熱", "低軌", "衛星",
+        "機器人", "重電", "PCB", "CoWoS"
     ]
 
+    title_lower = title.lower()
+
     for k in key_list:
-        if k.lower() in title.lower():
+        if k.lower() in title_lower:
             keywords.append(k)
             score += 1
 
@@ -127,7 +171,9 @@ def main():
     symbols = read_source_symbols(ss)
     ws_news = get_ws(ss, WS_NEWS)
 
-    fetched_at = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    fetched_at = datetime.now(
+        timezone(timedelta(hours=8))
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
     output = [HEADERS]
     seen = set()
@@ -148,9 +194,11 @@ def main():
             title = item["Title"]
             link = item["Link"]
 
-            dedup_key = symbol + "|" + title
+            dedup_key = symbol + "|" + link[:100]
+
             if dedup_key in seen:
                 continue
+
             seen.add(dedup_key)
 
             keywords, score = calc_score(title)
