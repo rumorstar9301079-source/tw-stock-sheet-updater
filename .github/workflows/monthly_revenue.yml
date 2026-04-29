@@ -1,0 +1,39 @@
+name: monthly-revenue
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 13 11 * *"
+    - cron: "30 13 16 * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -q gspread google-auth pandas requests
+
+      - name: Run revenue updater
+        env:
+          TZ: Asia/Taipei
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
+          WS_REVENUE: REVENUE
+          REVENUE_FETCH_YEARS: "2"
+          REVENUE_KEEP_MONTHS: "24"
+          REVENUE_INCREMENTAL_FETCH_MONTHS: "6"
+          REVENUE_REQUEST_SLEEP_SEC: "0"
+          REVENUE_REQUEST_PAUSE_EVERY: "100"
+          REVENUE_REQUEST_PAUSE_SEC: "0.5"
+        run: python update_revenue.py
