@@ -4,6 +4,7 @@ import time
 import json
 import feedparser
 import gspread
+from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 
@@ -95,11 +96,15 @@ def read_source_symbols(ss):
 
 def fetch_google_news(symbol, name):
     query = f"{symbol} {name} 股票"
-    url = (
-        "https://news.google.com/rss/search?q="
-        + query
-        + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    )
+
+    params = urlencode({
+        "q": query,
+        "hl": "zh-TW",
+        "gl": "TW",
+        "ceid": "TW:zh-Hant",
+    })
+
+    url = "https://news.google.com/rss/search?" + params
 
     feed = feedparser.parse(url)
 
