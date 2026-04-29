@@ -18,9 +18,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ✅ 加入 feedparser（抓新聞用）
       - name: Install deps
-        run: pip install -q gspread google-auth pandas requests
+        run: pip install -q gspread google-auth pandas requests feedparser
 
+      # ========================
+      # 指數
+      # ========================
       - name: Update TWII/TPEX sheet
         env:
           TZ: Asia/Taipei
@@ -31,6 +35,9 @@ jobs:
           TWII_TPEX_SHEET: "TWII/TPEX"
         run: python update_twii_tpex.py
 
+      # ========================
+      # 價格
+      # ========================
       - name: Run price updater
         env:
           TZ: Asia/Taipei
@@ -44,6 +51,9 @@ jobs:
           PRICES_INCREMENTAL_BUFFER_DAYS: "7"
         run: python update_prices.py
 
+      # ========================
+      # 營收
+      # ========================
       - name: Run revenue updater
         env:
           TZ: Asia/Taipei
@@ -59,3 +69,16 @@ jobs:
           REVENUE_REQUEST_PAUSE_EVERY: "50"
           REVENUE_REQUEST_PAUSE_SEC: "1"
         run: python update_revenue.py
+
+      # ========================
+      # 🆕 新聞（重點）
+      # ========================
+      - name: Run news updater
+        env:
+          TZ: Asia/Taipei
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WS_SOURCE_SHEET: SECTOR_MAP_MASTER_ALL_PLUS
+          WS_NEWS: NEWS
+          NEWS_LOOKBACK_DAYS: "7"
+        run: python update_news.py
