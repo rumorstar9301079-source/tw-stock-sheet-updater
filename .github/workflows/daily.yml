@@ -3,12 +3,14 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 8 * * 1-5"   # UTC 08:15 = Asia/Taipei 16:15 (Mon-Fri)
-    - cron: "10 13 * * 1-5"  # UTC 13:10 = Asia/Taipei 21:10 (Mon-Fri)
+    - cron: "30 0 * * 1-5"   # UTC 00:30 = 台灣 08:30（開盤前只補新聞）
+    - cron: "15 8 * * 1-5"   # UTC 08:15 = 台灣 16:15（收盤主更新）
+    - cron: "10 13 * * 1-5"  # UTC 13:10 = 台灣 21:10（晚間補更新）
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,14 +20,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ 加入 feedparser（抓新聞用）
+      # 安裝依賴
       - name: Install deps
-        run: pip install -q gspread google-auth pandas requests feedparser
+        run: |
+          pip install -q gspread google-auth pandas requests feedparser
 
       # ========================
-      # 指數
+      # 指數（08:30 不跑）
       # ========================
       - name: Update TWII/TPEX sheet
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '30 0 * * 1-5'
         env:
           TZ: Asia/Taipei
           SHEET_URL: ${{ secrets.SHEET_URL }}
@@ -36,9 +40,10 @@ jobs:
         run: python update_twii_tpex.py
 
       # ========================
-      # 價格
+      # 價格（08:30 不跑）
       # ========================
       - name: Run price updater
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '30 0 * * 1-5'
         env:
           TZ: Asia/Taipei
           SHEET_URL: ${{ secrets.SHEET_URL }}
@@ -52,7 +57,7 @@ jobs:
         run: python update_prices.py
 
       # ========================
-      # 🆕 新聞（重點）
+      # 新聞（每天三次）
       # ========================
       - name: Run news updater
         env:
