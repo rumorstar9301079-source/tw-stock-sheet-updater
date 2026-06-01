@@ -169,6 +169,26 @@ def calc_score(title):
     return ",".join(keywords), score
 
 
+
+def _is_google_retryable_error(e):
+    """判斷 Google Sheets API 是否為暫時性錯誤，可重試。"""
+    msg = str(e)
+    return any(code in msg for code in ["429", "500", "502", "503", "504"])
+
+
+def safe_sheet_call(func, *args, retries=5, wait=10, action_name="Google Sheets API", **kwargs):
+    """Google Sheets API 安全呼叫：遇到暫時性錯誤自動等待後重試。"""
+    for i in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            if _is_google_retryable_error(e) and i < retries - 1:
+                print(f"{action_name} 暫時失敗，等待 {wait} 秒後重試... ({i + 1}/{retries}) | {e}")
+                time.sleep(wait)
+                continue
+            raise
+
+
 def main():
     gc = auth_client()
     ss = gc.open_by_url(SHEET_URL)
@@ -224,8 +244,8 @@ def main():
 
         time.sleep(0.2)
 
-    ws_news.clear()
-    ws_news.update(values=output, range_name="A1")
+    safe_sheet_call(ws_news.clear, action_name="NEWS clear")
+    safe_sheet_call(ws_news.update, values=output, range_name="A1", action_name="NEWS update")
 
     print(f"NEWS updated: {len(output) - 1} rows")
 
